@@ -649,6 +649,185 @@ export class PigeonSocialService {
     await this.storage.delete(key)
     console.log('🗑️ deleteData completed for key:', key)
   }
+
+  // Comment functionality
+  async addComment(postId: string, content: string): Promise<Post | null> {
+    if (!this.currentUser) {
+      throw new Error('Must be logged in to add comments')
+    }
+
+    console.log('💬 Adding comment to post:', postId)
+    
+    // Extract original post ID if this is a shared post
+    let originalPostId = postId
+    if (postId.startsWith('shared_')) {
+      // Extract the original ID from shared_originalId_timestamp
+      const parts = postId.split('_')
+      if (parts.length >= 3) {
+        // Remove 'shared' and timestamp, keep the middle part(s)
+        originalPostId = parts.slice(1, -1).join('_')
+        console.log('💬 Extracted original post ID from shared post:', originalPostId)
+      }
+    } else {
+      console.log('💬 This is not a shared post, using original ID:', originalPostId)
+    }
+
+    const comment: Post = {
+      id: crypto.randomUUID(),
+      content,
+      author: this.currentUser.publicKey,
+      timestamp: Date.now(),
+      likes: 0,
+      comments: [],
+      replies: 0
+    }
+
+    console.log('💬 Looking for post with original ID:', originalPostId)
+
+    // Find the original post
+    let originalPost: Post | null = null
+    const postKey = `pigeon:posts.${originalPostId}`
+    console.log('💬 Looking for post with key:', postKey)
+    const postJson = localStorage.getItem(postKey)
+
+    if (postJson) {
+      originalPost = JSON.parse(postJson)
+      console.log('💬 Found post in localStorage with key:', postKey)
+      console.log('💬 Post has', originalPost?.comments?.length || 0, 'existing comments')
+    } else {
+      console.log('💬 Post not found in localStorage with key:', postKey)
+      console.log('💬 Available localStorage keys:', Object.keys(localStorage).filter(k => k.includes('posts')))
+      console.log('💬 Searching all posts...')
+      
+      // Search through user's own posts if not found
+      const userPostsKey = `pigeon:user_posts.${this.currentUser.publicKey}`
+      const userPostIds = JSON.parse(localStorage.getItem(userPostsKey) || '[]')
+      console.log('💬 Searching through', userPostIds.length, 'user posts')
+      
+      for (const userPostId of userPostIds) {
+        if (userPostId === originalPostId) {
+          const userPostKey = `pigeon:posts.${userPostId}`
+          const userPostJson = localStorage.getItem(userPostKey)
+          if (userPostJson) {
+            originalPost = JSON.parse(userPostJson)
+            console.log('💬 Found post in user posts!')
+            break
+          }
+        }
+      }
+      
+      // Search through followed posts if still not found
+      if (!originalPost) {
+        const followedPostsKey = `pigeon:followed_posts.${this.currentUser.publicKey}`
+        const followedPostIds = JSON.parse(localStorage.getItem(followedPostsKey) || '[]')
+        console.log('💬 Searching through', followedPostIds.length, 'followed posts')
+        
+        for (const followedPostId of followedPostIds) {
+          if (followedPostId === originalPostId) {
+            const followedPostKey = `pigeon:posts.${followedPostId}`
+            const followedPostJson = localStorage.getItem(followedPostKey)
+            if (followedPostJson) {
+              originalPost = JSON.parse(followedPostJson)
+              console.log('💬 Found post in followed posts!')
+              break
+            }
+          }
+        }
+      }
+    }
+
+    if (originalPost) {
+      console.log('💬 Successfully found original post:', originalPost.content.substring(0, 50) + '...')
+      
+      // Initialize comments array if it doesn't exist
+      if (!originalPost.comments) {
+        originalPost.comments = []
+      }
+      
+      // Add the comment to the post
+      originalPost.comments.push(comment)
+      
+      // Update replies count
+      originalPost.replies = (originalPost.replies || 0) + 1
+
+      // Save the updated post back to storage using the same key format
+      localStorage.setItem(postKey, JSON.stringify(originalPost))
+      console.log('💬 Updated post saved to localStorage')
+      
+      try {
+        await this.storage?.put(`posts.${originalPostId}`, originalPost)
+        console.log('💬 Updated original post with comment in distributed storage')
+      } catch (error) {
+        console.log('💬 Failed to update original post in distributed storage, but saved locally')
+      }
+
+      console.log('💬 Comment added successfully. Post now has', originalPost.comments.length, 'comments')
+    } else {
+      console.error('❌ Could not find original post to add comment to. PostID:', postId)
+      console.error('💬 Debug: Checked keys:', [
+        postKey,
+        `posts.${originalPostId}`,
+        'User posts and followed posts'
+      ])
+      return null
+    }
+
+    // Share the comment with friends (they'll get the updated post)
+    console.log('💬 Sharing updated post with', originalPost.comments.length, 'comments to friends')
+    this.shareCommentWithFriends(comment, originalPost)
+
+    return originalPost
+  }
+
+  async getComments(postId: string): Promise<Post[]> {
+    console.log('💬 Getting comments for post:', postId)
+    
+    // First try to get the post with its comments
+    let post: Post | null = null
+    
+    // Try localStorage first
+    const postKey = `pigeon:posts.${postId}`
+    const postJson = localStorage.getItem(postKey)
+    if (postJson) {
+      post = JSON.parse(postJson)
+    } else {
+      // Try distributed storage
+      post = await this.storage?.get(`posts.${postId}`) || null
+    }
+
+    if (post && post.comments) {
+      console.log('💬 Found', post.comments.length, 'comments in post object')
+      return post.comments
+    }
+
+    // Fallback: search for comments by parentId (less efficient but comprehensive)
+    const comments: Post[] = []
+    
+    try {
+      // This is not ideal but we'll search through known posts for comments
+      // In a real implementation, you'd have a comments index
+      console.log('💬 Searching for orphaned comments (fallback method)')
+      
+      // This is a simplified search - in production you'd want a proper index
+      return comments
+    } catch (error) {
+      console.error('Failed to get comments:', error)
+      return []
+    }
+  }
+
+  private async shareCommentWithFriends(_comment: Post, originalPost: Post): Promise<void> {
+    try {
+      console.log('💬 Sharing comment with friends')
+      const { friendService } = await import('./friendService')
+      
+      // Share the updated original post (which now contains the new comment)
+      await friendService.sharePostWithFriends(originalPost)
+      console.log('💬 Updated post with comment shared with friends')
+    } catch (error) {
+      console.error('Failed to share comment with friends:', error)
+    }
+  }
 }
 
 export const pigeonSocial = new PigeonSocialService()

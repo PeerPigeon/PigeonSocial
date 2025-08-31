@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react'
+import { useState, useEffect, useRef } from 'react'
 import { motion, AnimatePresence } from 'framer-motion'
 import { Send, X, Lock } from 'lucide-react'
 import { friendService, Friend } from '../services/friendService'
@@ -25,6 +25,16 @@ export function Messaging({ user, friend, onClose }: MessagingProps) {
   const [newMessage, setNewMessage] = useState('')
   const [isSending, setIsSending] = useState(false)
   const [isConnected, setIsConnected] = useState(false)
+  const messagesEndRef = useRef<HTMLDivElement>(null)
+
+  // Auto-scroll to bottom when messages change
+  const scrollToBottom = () => {
+    messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' })
+  }
+
+  useEffect(() => {
+    scrollToBottom()
+  }, [messages])
 
   useEffect(() => {
     // Check initial connection status using friend's status instead of getPeerConnectionStatus
@@ -41,7 +51,7 @@ export function Messaging({ user, friend, onClose }: MessagingProps) {
         // Convert ChatMessage[] to Message[]
         const uiMessages: Message[] = chatMessages.map(msg => ({
           id: msg.id,
-          content: msg.content,
+          content: typeof msg.content === 'string' ? msg.content : '[Encrypted Message]',
           timestamp: msg.timestamp,
           fromSelf: msg.fromPublicKey === user.publicKey,
           encrypted: msg.encrypted || false
@@ -82,18 +92,27 @@ export function Messaging({ user, friend, onClose }: MessagingProps) {
       }
     }
 
+    // Listen for missed messages being received
+    const handleMissedMessages = async () => {
+      console.log('📥 Received missed messages, reloading conversation')
+      // Reload message history to include the missed messages
+      await loadMessageHistory()
+    }
+
     friendService.on('peer:message', handleMessage)
     friendService.on('friends:status-updated', handleFriendsStatusUpdated)
+    friendService.on('messages:missed-received', handleMissedMessages)
 
     // Cleanup
     return () => {
       friendService.off('peer:message', handleMessage)
       friendService.off('friends:status-updated', handleFriendsStatusUpdated)
+      friendService.off('messages:missed-received', handleMissedMessages)
     }
   }, [friend.publicKey, friend.userInfo.username])
 
   const handleSendMessage = async () => {
-    if (!newMessage.trim() || isSending || !isConnected) return
+    if (!newMessage.trim() || isSending) return
 
     setIsSending(true)
     
@@ -109,8 +128,14 @@ export function Messaging({ user, friend, onClose }: MessagingProps) {
       }
       setMessages(prev => [...prev, newMsg])
       
-      // Send message
-      await friendService.sendMessageToFriend(friend.publicKey, message)
+      // Send message (this will queue it if friend is offline)
+      const success = await friendService.sendMessageToFriend(friend.publicKey, message)
+      
+      if (!success && !isConnected) {
+        // Message was queued for offline delivery - show a subtle indicator
+        console.log('📤 Message queued for delivery when friend comes online')
+      }
+      
       setNewMessage('')
     } catch (error) {
       console.error('Failed to send message:', error)
@@ -218,6 +243,9 @@ export function Messaging({ user, friend, onClose }: MessagingProps) {
             ))}
           </AnimatePresence>
           
+          {/* Auto-scroll target */}
+          <div ref={messagesEndRef} />
+          
           {messages.length === 0 && (
             <div className="text-center text-slate-400 mt-8">
               <div className="w-16 h-16 mx-auto mb-4 bg-slate-800 rounded-full flex items-center justify-center">
@@ -237,13 +265,13 @@ export function Messaging({ user, friend, onClose }: MessagingProps) {
               value={newMessage}
               onChange={(e) => setNewMessage(e.target.value)}
               onKeyPress={handleKeyPress}
-              placeholder={isConnected ? "Type a message..." : "Waiting for connection..."}
-              disabled={!isConnected || isSending}
+              placeholder={isConnected ? "Type a message..." : "Type a message (will be delivered when online)..."}
+              disabled={isSending}
               className="flex-1 bg-slate-700 border border-slate-600 rounded-xl px-4 py-3 text-white placeholder-slate-400 focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:border-transparent disabled:opacity-50 disabled:cursor-not-allowed transition-all duration-200"
             />
             <button
               onClick={handleSendMessage}
-              disabled={!newMessage.trim() || !isConnected || isSending}
+              disabled={!newMessage.trim() || isSending}
               className="bg-gradient-to-r from-indigo-500 to-purple-600 hover:from-indigo-600 hover:to-purple-700 text-white rounded-xl px-4 py-3 disabled:opacity-50 disabled:cursor-not-allowed transition-all duration-200 shadow-lg hover:shadow-xl flex items-center justify-center min-w-[50px]"
             >
               {isSending ? (

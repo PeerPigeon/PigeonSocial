@@ -72,8 +72,190 @@ export class FriendService {
   private cleanupInterval: NodeJS.Timeout | null = null // Periodic cleanup
   private monitoringEnabled = true // Allow disabling monitoring if needed
 
+  // Offline message queuing
+  private messageQueue = new Map<string, Array<{ content: string; timestamp: number; id: string }>>() // publicKey -> queued messages
+  private lastSeenTimestamps = new Map<string, number>() // publicKey -> last seen timestamp
+  private outgoingPostQueue = new Map<string, Array<{ post: any; timestamp: number; id: string }>>() // publicKey -> queued posts
+
   private constructor() {
     // Constructor is now clean since we use UnSea functions directly
+    this.loadOfflineQueues()
+  }
+
+  // Load offline queues from localStorage
+  private loadOfflineQueues() {
+    try {
+      const savedMessageQueue = localStorage.getItem('pigeon:message_queue')
+      if (savedMessageQueue) {
+        const parsed = JSON.parse(savedMessageQueue)
+        this.messageQueue = new Map(Object.entries(parsed))
+        console.log('📋 Loaded message queue for', this.messageQueue.size, 'friends')
+      }
+
+      const savedPostQueue = localStorage.getItem('pigeon:post_queue')
+      if (savedPostQueue) {
+        const parsed = JSON.parse(savedPostQueue)
+        this.outgoingPostQueue = new Map(Object.entries(parsed))
+        console.log('📋 Loaded post queue for', this.outgoingPostQueue.size, 'friends')
+      }
+
+      const savedLastSeen = localStorage.getItem('pigeon:last_seen_timestamps')
+      if (savedLastSeen) {
+        const parsed = JSON.parse(savedLastSeen)
+        this.lastSeenTimestamps = new Map(Object.entries(parsed).map(([k, v]) => [k, Number(v)]))
+        console.log('📋 Loaded last seen timestamps for', this.lastSeenTimestamps.size, 'friends')
+      }
+    } catch (error) {
+      console.error('❌ Failed to load offline queues:', error)
+    }
+  }
+
+  // Save offline queues to localStorage
+  private saveOfflineQueues() {
+    try {
+      localStorage.setItem('pigeon:message_queue', JSON.stringify(Object.fromEntries(this.messageQueue)))
+      localStorage.setItem('pigeon:post_queue', JSON.stringify(Object.fromEntries(this.outgoingPostQueue)))
+      localStorage.setItem('pigeon:last_seen_timestamps', JSON.stringify(Object.fromEntries(this.lastSeenTimestamps)))
+    } catch (error) {
+      console.error('❌ Failed to save offline queues:', error)
+    }
+  }
+
+  // Queue a message for offline friend
+  private queueMessageForOfflineFriend(friendPublicKey: string, content: string) {
+    const queuedMessage = {
+      content,
+      timestamp: Date.now(),
+      id: crypto.randomUUID()
+    }
+
+    if (!this.messageQueue.has(friendPublicKey)) {
+      this.messageQueue.set(friendPublicKey, [])
+    }
+
+    this.messageQueue.get(friendPublicKey)!.push(queuedMessage)
+    this.saveOfflineQueues()
+    console.log('📤 Queued message for offline friend:', friendPublicKey.substring(0, 8) + '...')
+  }
+
+  // Queue a post for offline friends
+  private queuePostForOfflineFriends(post: any) {
+    const queuedPost = {
+      post,
+      timestamp: Date.now(),
+      id: crypto.randomUUID()
+    }
+
+    // Queue for all offline friends who follow us
+    this.friends.forEach(friend => {
+      if (friend.connectionStatus === 'offline') {
+        if (!this.outgoingPostQueue.has(friend.publicKey)) {
+          this.outgoingPostQueue.set(friend.publicKey, [])
+        }
+        this.outgoingPostQueue.get(friend.publicKey)!.push(queuedPost)
+        console.log('📤 Queued post for offline friend:', friend.userInfo.displayName)
+      }
+    })
+
+    this.saveOfflineQueues()
+  }
+
+  // Deliver queued messages and posts when friend comes online
+  private async deliverQueuedContent(friendPublicKey: string) {
+    console.log('📦 Delivering queued content to friend:', friendPublicKey.substring(0, 8) + '...')
+
+    // Deliver queued messages
+    const queuedMessages = this.messageQueue.get(friendPublicKey) || []
+    if (queuedMessages.length > 0) {
+      console.log('📤 Delivering', queuedMessages.length, 'queued messages')
+      for (const queuedMsg of queuedMessages) {
+        try {
+          await this.sendMessage(friendPublicKey, queuedMsg.content)
+          console.log('✅ Delivered queued message:', queuedMsg.id)
+        } catch (error) {
+          console.error('❌ Failed to deliver queued message:', error)
+          break // Stop delivery on first failure to preserve order
+        }
+      }
+      // Clear delivered messages
+      this.messageQueue.delete(friendPublicKey)
+    }
+
+    // Deliver queued posts
+    const queuedPosts = this.outgoingPostQueue.get(friendPublicKey) || []
+    if (queuedPosts.length > 0) {
+      console.log('📤 Delivering', queuedPosts.length, 'queued posts')
+      for (const queuedPost of queuedPosts) {
+        try {
+          const peerId = this.peerIdMap.get(friendPublicKey)
+          if (peerId && this.mesh) {
+            const shareMessage = {
+              type: 'shared_post',
+              post: queuedPost.post,
+              timestamp: queuedPost.timestamp
+            }
+            await this.mesh.sendDirectMessage(peerId, JSON.stringify(shareMessage))
+            console.log('✅ Delivered queued post:', queuedPost.id)
+          }
+        } catch (error) {
+          console.error('❌ Failed to deliver queued post:', error)
+          break // Stop delivery on first failure
+        }
+      }
+      // Clear delivered posts
+      this.outgoingPostQueue.delete(friendPublicKey)
+    }
+
+    // Request missed content from the friend
+    await this.requestMissedContent(friendPublicKey)
+
+    this.saveOfflineQueues()
+  }
+
+  // Request missed messages and posts from when we were offline
+  private async requestMissedContent(friendPublicKey: string) {
+    const lastSeenTimestamp = this.lastSeenTimestamps.get(friendPublicKey) || 0
+    const currentTimestamp = Date.now()
+
+    console.log('📥 Requesting missed content from friend since:', new Date(lastSeenTimestamp).toLocaleString())
+
+    try {
+      const peerId = this.peerIdMap.get(friendPublicKey)
+      if (!peerId || !this.mesh) {
+        console.log('❌ Cannot request missed content - friend not connected')
+        return
+      }
+
+      // Request missed messages
+      const missedMessagesRequest = {
+        type: 'request_missed_messages',
+        since: lastSeenTimestamp,
+        requestId: crypto.randomUUID(),
+        timestamp: currentTimestamp
+      }
+
+      await this.mesh.sendDirectMessage(peerId, JSON.stringify(missedMessagesRequest))
+
+      // Request missed posts
+      const missedPostsRequest = {
+        type: 'request_missed_posts',
+        since: lastSeenTimestamp,
+        requestId: crypto.randomUUID(),
+        timestamp: currentTimestamp
+      }
+
+      await this.mesh.sendDirectMessage(peerId, JSON.stringify(missedPostsRequest))
+
+      console.log('📥 Requested missed content from friend')
+    } catch (error) {
+      console.error('❌ Failed to request missed content:', error)
+    }
+  }
+
+  // Update last seen timestamp for a friend
+  private updateLastSeenTimestamp(friendPublicKey: string) {
+    this.lastSeenTimestamps.set(friendPublicKey, Date.now())
+    this.saveOfflineQueues()
   }
 
   static getInstance(): FriendService {
@@ -525,6 +707,10 @@ export class FriendService {
         if (friend) {
           friend.connectionStatus = 'offline'
           friend.lastSeen = new Date()
+          
+          // Update last seen timestamp for offline message handling
+          this.updateLastSeenTimestamp(publicKey)
+          
           this.persistFriends()
           this.emit('friends:updated', this.friends)
           this.emit('friends:status-updated')
@@ -627,6 +813,18 @@ export class FriendService {
         case 'recent_posts_response':
           this.handlePostsResponse(messageContent, fromPeerId)
           break
+        case 'request_missed_messages':
+          this.handleMissedMessagesRequest(messageContent, fromPeerId)
+          break
+        case 'missed_messages_response':
+          this.handleMissedMessagesResponse(messageContent, fromPeerId)
+          break
+        case 'request_missed_posts':
+          this.handleMissedPostsRequest(messageContent, fromPeerId)
+          break
+        case 'missed_posts_response':
+          this.handleMissedPostsResponse(messageContent, fromPeerId)
+          break
         case 'peer_discovery_request':
         case 'direct_peer_discovery':
           this.handlePeerDiscoveryRequest(messageContent, fromPeerId)
@@ -651,7 +849,7 @@ export class FriendService {
     }
   }
 
-  private handleUserInfo(message: any, fromPeerId: string) {
+  private async handleUserInfo(message: any, fromPeerId: string) {
     console.log('👤 Received user info from:', message.username, 'publicKey:', message.publicKey.substring(0, 8) + '...')
     
     // Store peer info in discovered peers
@@ -710,6 +908,12 @@ export class FriendService {
       if (friend.userInfo.publicKey) {
         this.requestRecentPostsFromFriend(friend.userInfo.publicKey)
       }
+
+      // Update last seen timestamp for this friend
+      this.updateLastSeenTimestamp(message.publicKey)
+      
+      // Deliver any queued messages and posts now that friend is online
+      await this.deliverQueuedContent(message.publicKey)
       
       console.log('✅ Friend mapped and status updated to online via user info exchange')
     } else {
@@ -890,6 +1094,7 @@ export class FriendService {
   private async handleSharedPost(message: any, fromPeerId: string) {
     console.log('📥 Received shared post from peer:', fromPeerId)
     console.log('📥 Post content:', message.post?.content?.substring(0, 50) + '...')
+    console.log('📥 Post has', message.post?.comments?.length || 0, 'comments')
     
     // Find the friend using the peerIdMap (reverse lookup)
     let friend = null
@@ -903,17 +1108,45 @@ export class FriendService {
     if (friend && message.post) {
       console.log('✅ Found friend for shared post:', friend.userInfo.username)
       
-      // Save the shared post to our local feed cache
-      await pigeonSocial.saveFollowedPost(message.post)
-      console.log('💾 Saved shared post to local feed cache')
+      // Check if this is an updated post (with comments) by looking for existing post
+      const postKey = `pigeon:posts.${message.post.id}`
+      const existingPostJson = localStorage.getItem(postKey)
       
-      // Also emit event for the main feed to pick up immediately
-      this.emit('post:shared', {
-        post: message.post,
-        sharedBy: friend,
-        sharedAt: message.sharedAt
-      })
-      console.log('📡 Emitted post:shared event for:', friend.userInfo.username)
+      if (existingPostJson) {
+        const existingPost = JSON.parse(existingPostJson)
+        console.log('📥 Found existing post, updating with new comments')
+        console.log('📥 Old comments:', existingPost.comments?.length || 0, 'New comments:', message.post.comments?.length || 0)
+        
+        // Update the existing post with new data (including comments)
+        const updatedPost = {
+          ...existingPost,
+          ...message.post,
+          comments: message.post.comments || existingPost.comments || []
+        }
+        
+        localStorage.setItem(postKey, JSON.stringify(updatedPost))
+        console.log('💾 Updated existing post with new comments')
+        
+        // Emit event to update the UI
+        this.emit('post:updated', {
+          post: updatedPost,
+          updatedBy: friend
+        })
+      } else {
+        // This is a new post, save it normally
+        console.log('📥 New post from friend, saving to local feed cache')
+        await pigeonSocial.saveFollowedPost(message.post)
+        console.log('💾 Saved new shared post to local feed cache')
+        
+        // Emit event for the main feed to pick up immediately
+        this.emit('post:shared', {
+          post: message.post,
+          sharedBy: friend,
+          sharedAt: message.sharedAt
+        })
+      }
+      
+      console.log('📡 Emitted post event for:', friend.userInfo.username)
     } else {
       console.log('❌ No friend found for peer:', fromPeerId)
       console.log('📋 PeerIdMap:', Array.from(this.peerIdMap.entries()).map(([pk, pid]) => ({ 
@@ -1146,6 +1379,20 @@ export class FriendService {
     }
 
     try {
+      // Check if friend is online first
+      const friend = this.friends.find(f => f.publicKey === friendPublicKey)
+      if (!friend) {
+        console.error('❌ Cannot send message - friend not found')
+        return false
+      }
+
+      // If friend is offline, queue the message
+      if (friend.connectionStatus === 'offline') {
+        console.log('📤 Friend is offline, queuing message')
+        this.queueMessageForOfflineFriend(friendPublicKey, content)
+        return true // Return true as message is queued successfully
+      }
+
       // Get the actual connected peer ID from our mapping
       let actualPeerId = this.peerIdMap.get(friendPublicKey)
       
@@ -1162,22 +1409,14 @@ export class FriendService {
           displayName: f.userInfo.displayName
         })))
         
-        // EMERGENCY FALLBACK: If friend is marked as online but not in peerIdMap,
-        // and we have connected peers, map them directly
-        const connectedPeers = this.getConnectedPeers()
-        const friend = this.friends.find(f => f.publicKey === friendPublicKey)
-        
-        if (friend && friend.connectionStatus === 'online' && connectedPeers.length > 0) {
-          console.log('🚨 EMERGENCY MAPPING: Friend is online but not mapped, mapping to first connected peer')
-          const emergencyPeerId = connectedPeers[0]
-          this.peerIdMap.set(friendPublicKey, emergencyPeerId)
-          console.log(`🚨 Emergency mapped ${friendPublicKey.substring(0, 8)}... -> ${emergencyPeerId}`)
-          
-          // Continue with the emergency peer ID
-          actualPeerId = emergencyPeerId
-        } else {
-          return false
+        // If friend is marked as online but not in peerIdMap, queue the message
+        if (friend.connectionStatus === 'online') {
+          console.log('🚨 Friend marked online but not connected, queuing message')
+          this.queueMessageForOfflineFriend(friendPublicKey, content)
+          return true
         }
+        
+        return false
       }
       
       const message: any = {
@@ -2070,12 +2309,135 @@ export class FriendService {
     }
   }
 
+  // Handle request for missed messages
+  private async handleMissedMessagesRequest(message: any, fromPeerId: string) {
+    try {
+      console.log('📥 Received request for missed messages from:', fromPeerId, 'since:', new Date(message.since).toLocaleString())
+      
+      const currentUser = await pigeonSocial.getCurrentUser()
+      if (!currentUser) return
+
+      // Find the friend's public key from the peer ID
+      let friendPublicKey = ''
+      for (const [publicKey, mappedPeerId] of this.peerIdMap.entries()) {
+        if (mappedPeerId === fromPeerId) {
+          friendPublicKey = publicKey
+          break
+        }
+      }
+
+      if (!friendPublicKey) {
+        console.log('❌ Could not find friend public key for peer:', fromPeerId)
+        return
+      }
+
+      // Get messages sent since the requested timestamp
+      const allMessages = await this.getMessagesForFriend(friendPublicKey, currentUser.publicKey)
+      const missedMessages = allMessages.filter(msg => 
+        msg.timestamp > message.since && msg.fromPublicKey === currentUser.publicKey
+      )
+      
+      console.log('📤 Found', missedMessages.length, 'missed messages to send')
+
+      const response = {
+        type: 'missed_messages_response',
+        requestId: message.requestId,
+        messages: missedMessages,
+        timestamp: Date.now()
+      }
+
+      await this.mesh!.sendDirectMessage(fromPeerId, JSON.stringify(response))
+      console.log('📤 Sent', missedMessages.length, 'missed messages to friend')
+    } catch (error) {
+      console.error('❌ Failed to handle missed messages request:', error)
+    }
+  }
+
+  // Handle response with missed messages
+  private async handleMissedMessagesResponse(message: any, fromPeerId: string) {
+    try {
+      console.log('📥 Received', message.messages?.length || 0, 'missed messages from friend:', fromPeerId)
+      
+      if (message.messages && message.messages.length > 0) {
+        // Process each missed message
+        for (const missedMsg of message.messages) {
+          // Save the message to local storage
+          await this.saveMessage(missedMsg)
+          
+          // Emit message received event for UI
+          this.emit('peer:message', {
+            fromPublicKey: missedMsg.fromPublicKey,
+            message: {
+              content: missedMsg.content,
+              timestamp: missedMsg.timestamp,
+              encrypted: missedMsg.encrypted
+            }
+          })
+        }
+        console.log('💾 Processed', message.messages.length, 'missed messages')
+      }
+    } catch (error) {
+      console.error('❌ Failed to handle missed messages response:', error)
+    }
+  }
+
+  // Handle request for missed posts
+  private async handleMissedPostsRequest(message: any, fromPeerId: string) {
+    try {
+      console.log('📥 Received request for missed posts from:', fromPeerId, 'since:', new Date(message.since).toLocaleString())
+      
+      const currentUser = await pigeonSocial.getCurrentUser()
+      if (!currentUser) return
+
+      // Get our posts created since the requested timestamp
+      const allPosts = await pigeonSocial.getRecentPostsFromUser(currentUser.publicKey, 50) // Get more posts to filter
+      const missedPosts = allPosts.filter(post => post.timestamp > message.since)
+      
+      console.log('📤 Found', missedPosts.length, 'missed posts to send')
+
+      const response = {
+        type: 'missed_posts_response',
+        requestId: message.requestId,
+        posts: missedPosts,
+        timestamp: Date.now()
+      }
+
+      await this.mesh!.sendDirectMessage(fromPeerId, JSON.stringify(response))
+      console.log('📤 Sent', missedPosts.length, 'missed posts to friend')
+    } catch (error) {
+      console.error('❌ Failed to handle missed posts request:', error)
+    }
+  }
+
+  // Handle response with missed posts
+  private async handleMissedPostsResponse(message: any, fromPeerId: string) {
+    try {
+      console.log('📥 Received', message.posts?.length || 0, 'missed posts from friend:', fromPeerId)
+      
+      if (message.posts && message.posts.length > 0) {
+        // Save the friend's missed posts to our local feed cache
+        for (const post of message.posts) {
+          await pigeonSocial.saveFollowedPost(post)
+        }
+        console.log('💾 Saved', message.posts.length, 'missed posts to local feed cache')
+        
+        // Emit event to refresh the feed
+        this.emit('missed-content:received', { type: 'posts', count: message.posts.length })
+      }
+    } catch (error) {
+      console.error('❌ Failed to handle missed posts response:', error)
+    }
+  }
+
   async sharePostWithFriends(post: any): Promise<void> {
-    console.log('📤 Sharing post with all connected friends:', post.id)
+    console.log('📤 Sharing post with all friends:', post.id)
     try {
       const connectedFriends = this.friends.filter(f => f.connectionStatus === 'online')
-      console.log('📤 Found', connectedFriends.length, 'online friends to share with')
+      const offlineFriends = this.friends.filter(f => f.connectionStatus === 'offline')
       
+      console.log('📤 Found', connectedFriends.length, 'online friends and', offlineFriends.length, 'offline friends')
+      
+      // Share with online friends immediately
       for (const friend of connectedFriends) {
         const peerId = this.peerIdMap.get(friend.publicKey)
         if (peerId && this.mesh) {
@@ -2085,9 +2447,15 @@ export class FriendService {
             timestamp: Date.now()
           }
           
-          console.log('📤 Sharing post with friend:', friend.userInfo.displayName, 'peerId:', peerId)
+          console.log('📤 Sharing post with online friend:', friend.userInfo.displayName, 'peerId:', peerId)
           await this.mesh.sendDirectMessage(peerId, JSON.stringify(shareMessage))
         }
+      }
+
+      // Queue post for offline friends
+      if (offlineFriends.length > 0) {
+        this.queuePostForOfflineFriends(post)
+        console.log('📤 Queued post for', offlineFriends.length, 'offline friends')
       }
     } catch (error) {
       console.error('❌ Failed to share post with friends:', error)

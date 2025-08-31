@@ -46,13 +46,48 @@ export function MainFeed({ user, onLogout }: MainFeedProps) {
       
       setPosts(prevPosts => [sharedPost, ...prevPosts])
     }
+
+        // Listen for missed content being received
+    const handleMissedContent = async ({ type, count }: any) => {
+      console.log(`📥 MainFeed received notification of ${count} missed ${type}`)
+      
+      // Refresh the feed to show the new content
+      try {
+        const feedPosts = await pigeonSocial.getFeed()
+        setPosts(feedPosts)
+        console.log('✅ Feed refreshed after receiving missed content')
+      } catch (error) {
+        console.error('Failed to refresh feed after missed content:', error)
+      }
+    }
+
+    // Listen for post updates (like new comments)
+    const handlePostUpdated = ({ post, updatedBy }: any) => {
+      console.log('📥 MainFeed received post update from:', updatedBy.userInfo.username)
+      console.log('📥 Updated post ID:', post.id, 'has', post.comments?.length || 0, 'comments')
+      
+      // Update the post in the current feed
+      setPosts(prevPosts => {
+        const updated = prevPosts.map(existingPost => 
+          existingPost.id === post.id 
+            ? { ...post, comments: post.comments || [] }
+            : existingPost
+        )
+        console.log('✅ Updated post in feed, new feed has', updated.filter(p => p.id === post.id)[0]?.comments?.length || 0, 'comments')
+        return updated
+      })
+    }
     
     friendService.on('post:shared', handleSharedPost)
+    friendService.on('missed-content:received', handleMissedContent)
+    friendService.on('post:updated', handlePostUpdated)
     
     // Cleanup
     return () => {
-      // Remove event listener on unmount
+      // Remove event listeners on unmount
       friendService.off('post:shared', handleSharedPost)
+      friendService.off('missed-content:received', handleMissedContent)
+      friendService.off('post:updated', handlePostUpdated)
     }
   }, [])
 
@@ -128,6 +163,17 @@ export function MainFeed({ user, onLogout }: MainFeedProps) {
     } catch (error) {
       console.error('Failed to like post:', error)
     }
+  }
+
+  const handlePostUpdate = (updatedPost: Post) => {
+    console.log('📝 MainFeed: Updating post:', updatedPost.id, 'with', updatedPost.comments?.length || 0, 'comments')
+    setPosts(prevPosts => 
+      prevPosts.map(post => 
+        post.id === updatedPost.id 
+          ? updatedPost
+          : post
+      )
+    )
   }
 
   const handleCopyPublicKey = async () => {
@@ -298,6 +344,7 @@ export function MainFeed({ user, onLogout }: MainFeedProps) {
                     author={getPostAuthor(post)}
                     currentUser={user}
                     onLike={() => handleLike(post.id)}
+                    onUpdate={handlePostUpdate}
                   />
                 </motion.div>
               ))}

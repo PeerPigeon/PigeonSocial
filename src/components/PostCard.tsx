@@ -1,8 +1,8 @@
-import { motion } from 'framer-motion'
-import { Heart, MessageCircle, Share, User, UserPlus, Info } from 'lucide-react'
-import { Post, UserProfile } from '../services/pigeonSocial'
+import { motion, AnimatePresence } from 'framer-motion'
+import { Heart, MessageCircle, Share, User, UserPlus, Info, Send } from 'lucide-react'
+import { Post, UserProfile, pigeonSocial } from '../services/pigeonSocial'
 import { friendService } from '../services/friendService'
-import { useState } from 'react'
+import { useState, useEffect } from 'react'
 
 interface PostCardProps {
   post: Post & { 
@@ -12,10 +12,21 @@ interface PostCardProps {
   author: UserProfile
   currentUser: UserProfile
   onLike: () => void
+  onUpdate?: (updatedPost: Post) => void // Add callback for post updates
 }
 
-export function PostCard({ post, author, currentUser, onLike }: PostCardProps) {
+export function PostCard({ post, author, currentUser, onLike, onUpdate }: PostCardProps) {
   const [showInfo, setShowInfo] = useState(false)
+  const [showComments, setShowComments] = useState(false)
+  const [comments, setComments] = useState<Post[]>(post.comments || [])
+  const [newComment, setNewComment] = useState('')
+  const [isAddingComment, setIsAddingComment] = useState(false)
+  
+  // Sync comments when post prop changes
+  useEffect(() => {
+    console.log('🔄 PostCard syncing comments for post:', post.id, 'new comments:', post.comments?.length || 0)
+    setComments(post.comments || [])
+  }, [post.comments, post.id])
   
   const formatTimestamp = (timestamp: number) => {
     const now = Date.now()
@@ -50,6 +61,54 @@ export function PostCard({ post, author, currentUser, onLike }: PostCardProps) {
 
   const handleUnfollow = () => {
     friendService.unfollowUser(author.publicKey)
+  }
+
+  const handleAddComment = async () => {
+    if (!newComment.trim() || isAddingComment) return
+
+    setIsAddingComment(true)
+    try {
+      console.log('💬 Adding comment to post:', post.id)
+      console.log('💬 Post details:', {
+        id: post.id,
+        author: post.author.substring(0, 8) + '...',
+        content: post.content.substring(0, 50) + '...',
+        hasComments: !!post.comments,
+        commentsLength: post.comments?.length || 0
+      })
+      
+      const updatedPost = await pigeonSocial.addComment(post.id, newComment.trim())
+      
+      if (updatedPost) {
+        // Update local comments state
+        setComments(updatedPost.comments || [])
+        setNewComment('')
+        
+        // Notify parent component of the update
+        if (onUpdate) {
+          onUpdate(updatedPost)
+        }
+        
+        console.log('✅ Comment added successfully')
+      } else {
+        console.error('❌ Failed to add comment - no updated post returned')
+      }
+    } catch (error) {
+      console.error('❌ Failed to add comment:', error)
+    } finally {
+      setIsAddingComment(false)
+    }
+  }
+
+  const handleToggleComments = () => {
+    setShowComments(!showComments)
+  }
+
+  const handleKeyPress = (e: React.KeyboardEvent) => {
+    if (e.key === 'Enter' && !e.shiftKey) {
+      e.preventDefault()
+      handleAddComment()
+    }
   }
 
   return (
@@ -148,12 +207,13 @@ export function PostCard({ post, author, currentUser, onLike }: PostCardProps) {
         <motion.button
           whileHover={{ scale: 1.1 }}
           whileTap={{ scale: 0.9 }}
+          onClick={handleToggleComments}
           className="flex items-center gap-3 hover:text-blue-500 transition-colors group/reply"
         >
           <div className="p-2 rounded-full group-hover/reply:bg-blue-50 transition-colors">
             <MessageCircle className="w-5 h-5" />
           </div>
-          <span className="text-sm font-medium">{post.replies}</span>
+          <span className="text-sm font-medium">{comments.length}</span>
         </motion.button>
 
         <motion.button
@@ -166,6 +226,86 @@ export function PostCard({ post, author, currentUser, onLike }: PostCardProps) {
           </div>
         </motion.button>
       </div>
+
+      {/* Comments Section */}
+      <AnimatePresence>
+        {showComments && (
+          <motion.div
+            initial={{ opacity: 0, height: 0 }}
+            animate={{ opacity: 1, height: 'auto' }}
+            exit={{ opacity: 0, height: 0 }}
+            className="mt-4 pt-4 border-t border-gray-100"
+          >
+            {/* Add Comment Input */}
+            <div className="mb-4">
+              <div className="flex gap-3">
+                <div className="w-8 h-8 bg-gradient-to-br from-indigo-500 via-purple-500 to-pink-500 rounded-full flex items-center justify-center text-white font-bold text-sm">
+                  {currentUser.displayName?.charAt(0).toUpperCase() || 'U'}
+                </div>
+                <div className="flex-1">
+                  <input
+                    type="text"
+                    value={newComment}
+                    onChange={(e) => setNewComment(e.target.value)}
+                    onKeyPress={handleKeyPress}
+                    placeholder="Add a comment..."
+                    disabled={isAddingComment}
+                    className="w-full px-3 py-2 border border-gray-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent disabled:opacity-50"
+                  />
+                </div>
+                <motion.button
+                  whileHover={{ scale: 1.05 }}
+                  whileTap={{ scale: 0.95 }}
+                  onClick={handleAddComment}
+                  disabled={!newComment.trim() || isAddingComment}
+                  className="px-4 py-2 bg-blue-500 text-white rounded-lg hover:bg-blue-600 disabled:opacity-50 disabled:cursor-not-allowed transition-colors flex items-center gap-2"
+                >
+                  {isAddingComment ? (
+                    <div className="w-4 h-4 border-2 border-white/30 border-t-white rounded-full animate-spin" />
+                  ) : (
+                    <Send className="w-4 h-4" />
+                  )}
+                </motion.button>
+              </div>
+            </div>
+
+            {/* Comments List */}
+            <div className="space-y-3">
+              {comments.map((comment) => (
+                <motion.div
+                  key={comment.id}
+                  initial={{ opacity: 0, y: 10 }}
+                  animate={{ opacity: 1, y: 0 }}
+                  className="flex gap-3 p-3 bg-gray-50 rounded-lg"
+                >
+                  <div className="w-6 h-6 bg-gradient-to-br from-blue-400 to-purple-500 rounded-full flex items-center justify-center text-white font-bold text-xs">
+                    {comment.authorName?.charAt(0).toUpperCase() || 'A'}
+                  </div>
+                  <div className="flex-1">
+                    <div className="flex items-center gap-2 mb-1">
+                      <span className="font-medium text-sm text-gray-900">
+                        {comment.authorName || 'Anonymous'}
+                      </span>
+                      <span className="text-xs text-gray-500">
+                        {new Date(comment.timestamp).toLocaleTimeString()}
+                      </span>
+                    </div>
+                    <p className="text-sm text-gray-700 leading-relaxed">
+                      {comment.content}
+                    </p>
+                  </div>
+                </motion.div>
+              ))}
+              
+              {comments.length === 0 && (
+                <p className="text-gray-500 text-sm italic text-center py-4">
+                  No comments yet. Be the first to comment!
+                </p>
+              )}
+            </div>
+          </motion.div>
+        )}
+      </AnimatePresence>
     </motion.div>
   )
 }
