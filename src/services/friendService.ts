@@ -38,14 +38,28 @@ export interface FriendRequest {
   encryptedInvite?: string
 }
 
+export interface Follow {
+  publicKey: string
+  userInfo: {
+    username: string
+    displayName: string
+    publicKey?: string
+    epub?: string
+  }
+  followedAt: number
+  lastPostSeen?: number
+}
+
 export class FriendService {
   private static instance: FriendService
   private mesh: PeerPigeonMesh | null = null
   private friends: Friend[] = []
+  private follows: Follow[] = []
   private friendRequests: FriendRequest[] = []
   private pendingRequests: Set<string> = new Set()
   private eventListeners = new Map<string, Function[]>()
   private isInitialized = false
+  private discoveredPeers = new Map<string, any>() // peerId -> peer info
   
   // Map of publicKey -> actual PeerPigeon peer ID
   private peerIdMap = new Map<string, string>()
@@ -132,6 +146,13 @@ export class FriendService {
         console.log('📋 Loaded', this.friends.length, 'friends from storage')
       }
 
+      // Load follows from localStorage
+      const savedFollows = localStorage.getItem('pigeon_follows')
+      if (savedFollows) {
+        this.follows = JSON.parse(savedFollows)
+        console.log('📋 Loaded', this.follows.length, 'follows from storage')
+      }
+
       // Load friend requests from localStorage
       const savedRequests = localStorage.getItem('pigeon_friend_requests')
       if (savedRequests) {
@@ -151,6 +172,14 @@ export class FriendService {
       localStorage.setItem('pigeon_friends', JSON.stringify(this.friends))
     } catch (error) {
       console.error('❌ Failed to persist friends:', error)
+    }
+  }
+
+  private persistFollows() {
+    try {
+      localStorage.setItem('pigeon_follows', JSON.stringify(this.follows))
+    } catch (error) {
+      console.error('❌ Failed to persist follows:', error)
     }
   }
 
@@ -180,17 +209,19 @@ export class FriendService {
 
   private async clearMessagesBetween(fromPublicKey: string, toPublicKey: string): Promise<void> {
     try {
-      // Get the message index first
-      const messageIds = await pigeonSocial.getData(`messageIndex.${fromPublicKey}.${toPublicKey}`) || []
+      // Get the message index from localStorage
+      const indexKey = `pigeon:messageIndex.${fromPublicKey}.${toPublicKey}`
+      const storedIndex = localStorage.getItem(indexKey)
+      const messageIds = storedIndex ? JSON.parse(storedIndex) : []
       
-      // Delete each message by storing null
+      // Delete each message from localStorage
       for (const messageId of messageIds) {
-        const messageKey = `messages.${fromPublicKey}.${toPublicKey}.${messageId}`
-        await pigeonSocial.storeData(messageKey, null)
+        const messageKey = `pigeon:messages.${fromPublicKey}.${toPublicKey}.${messageId}`
+        localStorage.removeItem(messageKey)
       }
       
-      // Clear the message index by storing empty array
-      await pigeonSocial.storeData(`messageIndex.${fromPublicKey}.${toPublicKey}`, [])
+      // Clear the message index
+      localStorage.removeItem(indexKey)
       
       console.log(`🧹 Cleared ${messageIds.length} messages between ${fromPublicKey.substring(0, 8)}... and ${toPublicKey.substring(0, 8)}...`)
     } catch (error) {
@@ -198,13 +229,13 @@ export class FriendService {
     }
   }
 
-  // Message storage methods using PeerPigeon's distributed storage
+  // Message storage methods using localStorage (reliable)
   async saveMessage(message: ChatMessage): Promise<void> {
     try {
-      const messageKey = `messages.${message.fromPublicKey}.${message.toPublicKey}.${message.id}`
-      await pigeonSocial.storeData(messageKey, message)
+      const messageKey = `pigeon:messages.${message.fromPublicKey}.${message.toPublicKey}.${message.id}`
+      localStorage.setItem(messageKey, JSON.stringify(message))
       await this.updateMessageIndex(message.fromPublicKey, message.toPublicKey, message.id)
-      console.log('💾 Saved message to distributed storage:', message.id)
+      console.log('💾 Saved message to localStorage:', message.id)
     } catch (error) {
       console.error('❌ Failed to save message:', error)
     }
@@ -212,9 +243,14 @@ export class FriendService {
 
   async getMessagesForFriend(friendPublicKey: string, currentUserPublicKey: string): Promise<ChatMessage[]> {
     try {
-      // Get messages in both directions
+      console.log('📜 getMessagesForFriend: Loading messages between', currentUserPublicKey.substring(0, 8) + '...', 'and', friendPublicKey.substring(0, 8) + '...')
+      
+      // Get messages in both directions from localStorage
       const sentMessages = await this.getMessagesBetween(currentUserPublicKey, friendPublicKey)
+      console.log('📜 Found', sentMessages.length, 'sent messages')
+      
       const receivedMessages = await this.getMessagesBetween(friendPublicKey, currentUserPublicKey)
+      console.log('📜 Found', receivedMessages.length, 'received messages')
       
       // Combine and sort by timestamp
       const allMessages = [...sentMessages, ...receivedMessages]
@@ -225,29 +261,46 @@ export class FriendService {
         encrypted: sortedMessages.filter(m => m.encrypted).length
       })
       
-      // Decrypt messages for display
+      // Decrypt messages for display - handle both sent and received messages
       const decryptedMessages = await Promise.all(sortedMessages.map(async (message, index) => {
         // Check if message is marked as encrypted and has proper encrypted structure
         if (message.encrypted && typeof message.content === 'object' && message.content && (message.content as any).ciphertext) {
           try {
+            console.log(`🔓 Attempting to decrypt message ${index + 1}:`, {
+              messageId: message.id,
+              isOutgoing: message.fromPublicKey === currentUserPublicKey,
+              hasContent: !!message.content,
+              contentType: typeof message.content,
+              hasCiphertext: !!(message.content as any).ciphertext
+            })
+            
             // Get current user's UnSea keypair for decryption
             const currentUserKeypair = await pigeonSocial.getCurrentUserUnSeaKeypair()
-            if (currentUserKeypair) {
+            console.log(`🔑 Current user keypair for decryption:`, {
+              hasKeypair: !!currentUserKeypair,
+              hasEpriv: !!(currentUserKeypair?.epriv)
+            })
+            
+            if (currentUserKeypair && currentUserKeypair.epriv) {
+              // For both incoming and outgoing messages, we use our private key to decrypt
               const decryptedContent = await decryptMessageWithMeta(message.content as any, currentUserKeypair.epriv)
+              console.log(`✅ Successfully decrypted message ${index + 1}:`, decryptedContent.substring(0, 50) + '...')
               return {
                 ...message,
                 content: decryptedContent // Replace encrypted content with decrypted for display
               }
             } else {
+              console.log(`❌ No keypair or epriv for message ${index + 1}`)
               return {
                 ...message,
-                content: '[Encrypted Message - Cannot Decrypt]'
+                content: '[Encrypted Message - Cannot Decrypt: No Key]'
               }
             }
           } catch (error) {
             console.error(`❌ Failed to decrypt message ${index + 1}:`, {
               messageId: message.id,
-              error: (error as Error).message
+              error: (error as Error).message,
+              errorStack: (error as Error).stack
             })
             return {
               ...message,
@@ -273,22 +326,32 @@ export class FriendService {
 
   private async getMessagesBetween(fromPublicKey: string, toPublicKey: string): Promise<ChatMessage[]> {
     try {
-      // This is a simplified approach - in a real implementation, you'd want to
-      // maintain an index of message keys for better performance
-      const messagePrefix = `messages.${fromPublicKey}.${toPublicKey}.`
+      console.log('📜 getMessagesBetween: Looking for messages from', fromPublicKey.substring(0, 8) + '...', 'to', toPublicKey.substring(0, 8) + '...')
       
-      // For now, we'll store a message index as well
-      const messageIds = await pigeonSocial.getData(`messageIndex.${fromPublicKey}.${toPublicKey}`) || []
+      // Get message index from localStorage
+      const indexKey = `pigeon:messageIndex.${fromPublicKey}.${toPublicKey}`
+      console.log('📜 Looking for message index at key:', indexKey)
+      
+      const storedIndex = localStorage.getItem(indexKey)
+      const messageIds = storedIndex ? JSON.parse(storedIndex) : []
+      console.log('📜 Found message IDs:', messageIds)
       
       const messages: ChatMessage[] = []
       for (const messageId of messageIds) {
-        const messageKey = `${messagePrefix}${messageId}`
-        const message = await pigeonSocial.getData(messageKey)
-        if (message) {
+        const messageKey = `pigeon:messages.${fromPublicKey}.${toPublicKey}.${messageId}`
+        console.log('📜 Loading message from key:', messageKey)
+        const storedMessage = localStorage.getItem(messageKey)
+        if (storedMessage) {
+          const message = JSON.parse(storedMessage)
+          const contentPreview = typeof message.content === 'string' ? message.content.substring(0, 50) + '...' : 'encrypted content'
+          console.log('📜 Loaded message:', message.id, contentPreview)
           messages.push(message)
+        } else {
+          console.log('📜 No message found at key:', messageKey)
         }
       }
       
+      console.log('📜 getMessagesBetween returning', messages.length, 'messages')
       return messages
     } catch (error) {
       console.error('❌ Failed to get messages between users:', error)
@@ -298,12 +361,13 @@ export class FriendService {
 
   private async updateMessageIndex(fromPublicKey: string, toPublicKey: string, messageId: string): Promise<void> {
     try {
-      const indexKey = `messageIndex.${fromPublicKey}.${toPublicKey}`
-      const existingIds = await pigeonSocial.getData(indexKey) || []
+      const indexKey = `pigeon:messageIndex.${fromPublicKey}.${toPublicKey}`
+      const storedIndex = localStorage.getItem(indexKey)
+      const existingIds = storedIndex ? JSON.parse(storedIndex) : []
       
       if (!existingIds.includes(messageId)) {
         existingIds.push(messageId)
-        await pigeonSocial.storeData(indexKey, existingIds)
+        localStorage.setItem(indexKey, JSON.stringify(existingIds))
       }
     } catch (error) {
       console.error('❌ Failed to update message index:', error)
@@ -447,6 +511,9 @@ export class FriendService {
   private handlePeerDisconnected(peerId: string) {
     console.log('👋 Handling peer disconnection:', peerId)
     
+    // Remove from discovered peers
+    this.discoveredPeers.delete(peerId)
+    
     // Find and remove from peerIdMap
     for (const [publicKey, mappedPeerId] of this.peerIdMap.entries()) {
       if (mappedPeerId === peerId) {
@@ -469,6 +536,9 @@ export class FriendService {
     
     // Emit peer disconnected event for UI
     this.emit('peer:disconnected', { publicKey: peerId })
+    
+    // Emit updated peers list
+    this.emit('peers:discovered', Array.from(this.discoveredPeers.values()))
   }
 
   private async sendUserInfoToPeer(peerId: string) {
@@ -504,17 +574,24 @@ export class FriendService {
 
   private handleIncomingMessage(data: any) {
     try {
+      console.log('📨 Raw incoming message:', data)
+      
       // Try to extract the actual message content from various possible formats
       let messageContent = data.content || data.message || data.data || data
       let fromPeerId = data.from || data.peerId || data.sender || data.id
+      
+      console.log('📨 Extracted messageContent:', messageContent)
+      console.log('📨 Extracted fromPeerId:', fromPeerId)
       
       // If content is a string, try to parse it as JSON
       if (typeof messageContent === 'string') {
         try {
           messageContent = JSON.parse(messageContent)
+          console.log('📨 Parsed JSON messageContent:', messageContent)
         } catch (e) {
           // If it's not JSON, maybe it's a plain text message
           messageContent = { type: 'chat_message', content: messageContent, timestamp: Date.now() }
+          console.log('📨 Treating as plain text message:', messageContent)
         }
       }
       
@@ -544,6 +621,20 @@ export class FriendService {
         case 'shared_post':
           this.handleSharedPost(messageContent, fromPeerId)
           break
+        case 'request_recent_posts':
+          this.handlePostRequest(messageContent, fromPeerId)
+          break
+        case 'recent_posts_response':
+          this.handlePostsResponse(messageContent, fromPeerId)
+          break
+        case 'peer_discovery_request':
+        case 'direct_peer_discovery':
+          this.handlePeerDiscoveryRequest(messageContent, fromPeerId)
+          break
+        case 'peer_discovery_response':
+          this.handlePeerDiscoveryResponse(messageContent, fromPeerId)
+          break
+          break
         case 'ping':
           this.handlePingMessage(messageContent, fromPeerId)
           break
@@ -562,6 +653,18 @@ export class FriendService {
 
   private handleUserInfo(message: any, fromPeerId: string) {
     console.log('👤 Received user info from:', message.username, 'publicKey:', message.publicKey.substring(0, 8) + '...')
+    
+    // Store peer info in discovered peers
+    this.discoveredPeers.set(fromPeerId, {
+      peerId: fromPeerId,
+      publicKey: message.publicKey,
+      userInfo: {
+        username: message.username,
+        displayName: message.displayName || message.username,
+        publicKey: message.publicKey,
+        epub: message.unSeaEpub || message.epub
+      }
+    })
     
     // Check if this public key matches any of our friends
     const friend = this.friends.find(f => f.publicKey === message.publicKey)
@@ -602,9 +705,15 @@ export class FriendService {
       this.emit('friends:updated', this.friends)
       this.emit('friends:status-updated')
       
+      // Friend mapped successfully - now request recent posts
+      console.log('🔄 Friend mapped successfully, requesting recent posts from:', friend.userInfo.displayName || friend.userInfo.username)
+      if (friend.userInfo.publicKey) {
+        this.requestRecentPostsFromFriend(friend.userInfo.publicKey)
+      }
+      
       console.log('✅ Friend mapped and status updated to online via user info exchange')
     } else {
-      console.log('❌ User info from unknown peer:', message.username)
+      console.log('ℹ️ User info from non-friend peer:', message.username)
     }
     
     // Update peer info in discovered peers
@@ -614,6 +723,9 @@ export class FriendService {
       username: message.username,
       displayName: message.displayName
     })
+    
+    // Emit peers discovered event with updated peer list
+    this.emit('peers:discovered', Array.from(this.discoveredPeers.values()))
   }
 
   private handleFriendRequest(message: any, fromPeerId: string) {
@@ -651,8 +763,28 @@ export class FriendService {
 
       this.friends.push(friend)
       this.persistFriends()
+      
+      // Automatically follow the new friend so their posts appear in feed
+      const follow: Follow = {
+        publicKey: friend.publicKey,
+        userInfo: {
+          username: friend.userInfo.username,
+          displayName: friend.userInfo.displayName,
+          publicKey: friend.publicKey
+        },
+        followedAt: Date.now()
+      }
+      
+      this.follows.push(follow)
+      this.persistFollows()
+      console.log('✅ Automatically following new friend:', friend.userInfo.username)
+      
+      // Request recent posts from the new friend
+      this.requestRecentPostsFromFriend(friend.publicKey)
+      
       console.log('✅ Friend request accepted by:', message.username)
       this.emit('friends:updated', this.friends)
+      this.emit('follows:updated', this.follows)
       this.emit('friend-request:accepted', { friend })
     } else {
       console.log('❌ Friend request rejected by:', message.username)
@@ -720,12 +852,12 @@ export class FriendService {
       console.log(`🔍 Fallback friend lookup for ${fromPeerId}: ${friend?.userInfo.displayName || 'not found'}`)
     }
     
-    // Save the incoming message to distributed storage
+    // Save the incoming message to local storage (encrypted for security)
     const currentUser = await pigeonSocial.getCurrentUser()
     if (currentUser && friend) {
       const chatMessage: ChatMessage = {
         id: crypto.randomUUID(),
-        content: message.content, // Store the original encrypted content, not decrypted
+        content: message.content, // Store original content (encrypted if it was encrypted)
         timestamp: message.timestamp,
         fromPublicKey: fromPublicKey,
         toPublicKey: currentUser.publicKey,
@@ -733,7 +865,7 @@ export class FriendService {
       }
       
       await this.saveMessage(chatMessage)
-      console.log('💾 Saved incoming message to storage (encrypted)')
+      console.log('💾 Saved incoming message to localStorage (encrypted:', isEncrypted, ')')
     }
     
     this.emit('chat:message_received', {
@@ -755,24 +887,91 @@ export class FriendService {
     console.log('📢 Emitted peer:message event for:', friend ? friend.userInfo.username : fromPeerId)
   }
 
-  private handleSharedPost(message: any, fromPeerId: string) {
-    console.log('📥 Received shared post from:', fromPeerId)
+  private async handleSharedPost(message: any, fromPeerId: string) {
+    console.log('📥 Received shared post from peer:', fromPeerId)
+    console.log('📥 Post content:', message.post?.content?.substring(0, 50) + '...')
     
-    // Find the friend's full public key
-    const friend = this.friends.find(f => f.publicKey.startsWith(fromPeerId))
+    // Find the friend using the peerIdMap (reverse lookup)
+    let friend = null
+    for (const [publicKey, mappedPeerId] of this.peerIdMap.entries()) {
+      if (mappedPeerId === fromPeerId) {
+        friend = this.friends.find(f => f.publicKey === publicKey)
+        break
+      }
+    }
     
-    if (friend) {
-      // Emit event for the main feed to pick up
+    if (friend && message.post) {
+      console.log('✅ Found friend for shared post:', friend.userInfo.username)
+      
+      // Save the shared post to our local feed cache
+      await pigeonSocial.saveFollowedPost(message.post)
+      console.log('💾 Saved shared post to local feed cache')
+      
+      // Also emit event for the main feed to pick up immediately
       this.emit('post:shared', {
         post: message.post,
         sharedBy: friend,
         sharedAt: message.sharedAt
       })
+      console.log('📡 Emitted post:shared event for:', friend.userInfo.username)
+    } else {
+      console.log('❌ No friend found for peer:', fromPeerId)
+      console.log('📋 PeerIdMap:', Array.from(this.peerIdMap.entries()).map(([pk, pid]) => ({ 
+        publicKey: pk.substring(0, 8) + '...', 
+        peerId: pid 
+      })))
     }
   }
 
+  private async handlePeerDiscoveryRequest(_message: any, fromPeerId: string) {
+    console.log('🔍 Received peer discovery request from:', fromPeerId)
+    
+    try {
+      const currentUser = await pigeonSocial.getCurrentUser()
+      if (!currentUser || !this.mesh) return
+      
+      // Send back our peer info and known peers
+      const response = {
+        type: 'peer_discovery_response',
+        from: this.mesh.peerId,
+        userInfo: {
+          username: currentUser.username,
+          displayName: currentUser.displayName || currentUser.username,
+          publicKey: currentUser.publicKey
+        },
+        knownPeers: this.getConnectedPeers(), // Share our connected peers
+        timestamp: Date.now()
+      }
+      
+      await this.mesh.sendDirectMessage(fromPeerId, JSON.stringify(response))
+      console.log('📤 Sent discovery response to:', fromPeerId)
+    } catch (error) {
+      console.error('❌ Failed to handle discovery request:', error)
+    }
+  }
+
+  private handlePeerDiscoveryResponse(message: any, fromPeerId: string) {
+    console.log('🔍 Received peer discovery response from:', fromPeerId)
+    
+    // Store the peer info if it's not already stored
+    if (message.userInfo && !this.discoveredPeers.has(fromPeerId)) {
+      const peerInfo = {
+        peerId: fromPeerId,
+        publicKey: message.userInfo.publicKey || fromPeerId,
+        userInfo: message.userInfo,
+        connectionStatus: 'online',
+        discoveredAt: Date.now()
+      }
+      
+      this.discoveredPeers.set(fromPeerId, peerInfo)
+      console.log('✅ Added discovered peer:', message.userInfo.username)
+    }
+    
+    // TODO: Could also process message.knownPeers to discover indirect connections
+  }
+
   // Public API methods
-  async sendFriendRequest(publicKey: string, message?: string) {
+  async sendFriendRequest(publicKey: string, message?: string, targetPeerId?: string) {
     if (!this.mesh) {
       throw new Error('Mesh not initialized')
     }
@@ -783,8 +982,26 @@ export class FriendService {
         throw new Error('No current user')
       }
 
-      // Find peer by public key (assuming peerId is derived from public key)
-      const peerId = publicKey.substring(0, 40)
+      // Use provided peerId or try to find it from discovered peers, or fall back to derived peerId
+      let peerId = targetPeerId
+      if (!peerId) {
+        // Try to find the peerId from discovered peers
+        const discoveredPeer = Array.from(this.discoveredPeers.values()).find(peer => peer.publicKey === publicKey)
+        if (discoveredPeer) {
+          peerId = discoveredPeer.peerId
+        } else {
+          // Fall back to deriving from public key
+          peerId = publicKey.substring(0, 40)
+        }
+      }
+      
+      if (!peerId) {
+        throw new Error('Could not determine peer ID for friend request')
+      }
+      
+      console.log('📤 Sending friend request to peerId:', peerId.substring(0, 8) + '...', 'for publicKey:', publicKey.substring(0, 8) + '...')
+      console.log('📤 Available discovered peers:', Array.from(this.discoveredPeers.keys()).map(id => id.substring(0, 8) + '...'))
+      console.log('📤 Connected peers:', this.getConnectedPeers().map(id => id.substring(0, 8) + '...'))
       
       const friendRequest = {
         type: 'friend_request',
@@ -794,7 +1011,14 @@ export class FriendService {
         message: message || ''
       }
 
-      await this.mesh.sendDirectMessage(peerId, JSON.stringify(friendRequest))
+      console.log('📤 Attempting to send friend request:', friendRequest)
+      console.log('📤 Target peerId:', peerId)
+      console.log('📤 Mesh connected:', this.mesh.connected)
+      console.log('📤 Mesh peerId:', this.mesh.peerId)
+      
+      const result = await this.mesh.sendDirectMessage(peerId, JSON.stringify(friendRequest))
+      console.log('📤 sendDirectMessage result:', result)
+      
       this.pendingRequests.add(peerId)
       
       console.log('📤 Sent friend request to:', peerId.substring(0, 8) + '...')
@@ -844,12 +1068,31 @@ export class FriendService {
       this.friends.push(friend)
       this.persistFriends()
       
+      // Automatically follow the new friend so their posts appear in feed
+      const follow: Follow = {
+        publicKey: friend.publicKey,
+        userInfo: {
+          username: friend.userInfo.username,
+          displayName: friend.userInfo.displayName,
+          publicKey: friend.publicKey
+        },
+        followedAt: Date.now()
+      }
+      
+      this.follows.push(follow)
+      this.persistFollows()
+      console.log('✅ Automatically following new friend:', friend.userInfo.username)
+      
+      // Request recent posts from the new friend
+      this.requestRecentPostsFromFriend(friend.publicKey)
+      
       // Remove from requests
       this.friendRequests = this.friendRequests.filter(r => r.id !== requestId)
       this.persistFriendRequests()
       
       console.log('✅ Accepted friend request from:', request.fromUserInfo.username)
       this.emit('friends:updated', this.friends)
+      this.emit('follows:updated', this.follows)
       this.emit('friend_requests:updated', this.friendRequests)
       this.emit('friend-request:accepted', { friend })
       
@@ -972,14 +1215,14 @@ export class FriendService {
               epub: friend.userInfo.epub || friend.userInfo.publicKey // fallback
             }
             
-            // Encrypt using the friend's public key so they can decrypt it
-            const encryptedContent = await encryptMessageWithMeta(content, friendPublicKeypair)
-            console.log('🔐 Encrypted message content (length):', encryptedContent.length)
-            console.log('🔐 Encrypted content structure:', Object.keys(encryptedContent))
+            // Encrypt for friend (for transmission)
+            const encryptedContentForFriend = await encryptMessageWithMeta(content, friendPublicKeypair)
+            
+            console.log('🔐 Encrypted message content for friend (length):', encryptedContentForFriend.length)
             
             encryptedMessage = {
               ...message,
-              content: encryptedContent,
+              content: encryptedContentForFriend,
               encrypted: true
             }
             isEncrypted = true
@@ -1046,20 +1289,46 @@ export class FriendService {
       if (success) {
         console.log('💬 ✅ MESSAGE SUCCESSFULLY SENT TO ACTUAL PEER:', actualPeerId, 'Content:', content)
         
-        // Save the outgoing message to distributed storage
+        // Save the outgoing message to storage - use version encrypted for us
         const currentUser = await pigeonSocial.getCurrentUser()
         if (currentUser) {
+          // Use the encryptedForStorage if we created one, otherwise use the original encrypted content
+          let contentToStore = content
+          let encryptedFlag = false
+          
+          if (isEncrypted) {
+            // Try to access the encryptedForStorage variable from the encryption block
+            try {
+              // Get our current user's UnSea keypair
+              const currentUserKeypair = await pigeonSocial.getCurrentUserUnSeaKeypair()
+              if (currentUserKeypair) {
+                // Encrypt for ourselves (for storage) - use our own public key so we can decrypt with our private key
+                const ourPublicKeypair = {
+                  pub: currentUserKeypair.pub,
+                  epub: currentUserKeypair.epub
+                }
+                const encryptedContentForUs = await encryptMessageWithMeta(content, ourPublicKeypair)
+                contentToStore = encryptedContentForUs
+                encryptedFlag = true
+                console.log('🔐 Encrypted outgoing message for storage with our public key')
+              }
+            } catch (error) {
+              console.error('❌ Failed to encrypt outgoing message for storage:', error)
+              contentToStore = content // Fallback to plaintext
+            }
+          }
+          
           const chatMessage: ChatMessage = {
             id: crypto.randomUUID(),
-            content: isEncrypted ? encryptedMessage.content : content, // Store encrypted content if available
+            content: contentToStore,
             timestamp: message.timestamp,
             fromPublicKey: currentUser.publicKey,
             toPublicKey: friendPublicKey,
-            encrypted: isEncrypted
+            encrypted: encryptedFlag
           }
           
           await this.saveMessage(chatMessage)
-          console.log('💾 Saved outgoing message to storage (encrypted:', isEncrypted, ')')
+          console.log('💾 Saved outgoing message to localStorage (encrypted:', encryptedFlag, ')')
         }
       } else {
         console.error('❌ All message send methods failed for actual peer:', actualPeerId)
@@ -1077,18 +1346,28 @@ export class FriendService {
     return [...this.friends]
   }
 
+  getFollows(): Follow[] {
+    return [...this.follows]
+  }
+
   getFriendRequests(): FriendRequest[] {
     return [...this.friendRequests]
   }
 
   // Get message history for a friend
   async getMessageHistory(friendPublicKey: string): Promise<ChatMessage[]> {
+    console.log('📜 getMessageHistory called for:', friendPublicKey.substring(0, 8) + '...')
+    
     const currentUser = await pigeonSocial.getCurrentUser()
     if (!currentUser) {
+      console.log('❌ No current user found in getMessageHistory')
       return []
     }
     
-    return await this.getMessagesForFriend(friendPublicKey, currentUser.publicKey)
+    console.log('📜 Current user found, calling getMessagesForFriend...')
+    const messages = await this.getMessagesForFriend(friendPublicKey, currentUser.publicKey)
+    console.log('📜 getMessagesForFriend returned', messages.length, 'messages')
+    return messages
   }
 
   getPendingFriendRequests(): FriendRequest[] {
@@ -1100,12 +1379,73 @@ export class FriendService {
   }
 
   async discoverPeers(): Promise<any[]> {
-    // In PeerPigeon, peers are automatically discovered when connected to signaling server
-    // Return the connected peers
-    return this.getConnectedPeers().map(peerId => ({
-      peerId,
-      publicKey: peerId // Assuming peerId is derived from public key
+    console.log('🔍 Starting peer discovery...')
+    console.log('🔍 Mesh status:', {
+      hasMesh: !!this.mesh,
+      isConnected: this.mesh?.connected,
+      peerId: this.mesh?.peerId
+    })
+    
+    // First, get currently connected peers from the mesh
+    const connectedPeerIds = this.getConnectedPeers()
+    console.log('🔍 Connected peer IDs:', connectedPeerIds)
+    
+    // Request user info from all connected peers
+    if (connectedPeerIds.length > 0) {
+      console.log('📤 Requesting user info from', connectedPeerIds.length, 'connected peers')
+      for (const peerId of connectedPeerIds) {
+        try {
+          await this.sendUserInfoToPeer(peerId)
+        } catch (error) {
+          console.error('❌ Failed to request user info from peer:', peerId, error)
+        }
+      }
+      
+      // Give some time for responses to come back
+      await new Promise(resolve => setTimeout(resolve, 1000))
+    } else {
+      console.log('⚠️ No connected peers found for discovery')
+    }
+    
+    // Get peers that have exchanged user info
+    const peersWithInfo = Array.from(this.discoveredPeers.values())
+    console.log('� Peers with user info:', peersWithInfo.length)
+    
+    // Also include connected peers without full info as basic entries
+    const peersWithoutInfo = connectedPeerIds
+      .filter(peerId => !this.discoveredPeers.has(peerId))
+      .map(peerId => ({
+        peerId,
+        publicKey: peerId, // Use peerId as fallback
+        userInfo: {
+          username: `user_${peerId.substring(0, 8)}`,
+          displayName: `User ${peerId.substring(0, 8)}`,
+          publicKey: peerId
+        },
+        connectionStatus: 'online'
+      }))
+    
+    // Include existing friends in discovery (so they can be followed)
+    const friendsAsPeers = this.friends.map(friend => ({
+      peerId: friend.publicKey.substring(0, 40),
+      publicKey: friend.publicKey,
+      userInfo: friend.userInfo,
+      connectionStatus: friend.connectionStatus
     }))
+    
+    const allDiscoveredPeers = [...peersWithInfo, ...peersWithoutInfo, ...friendsAsPeers]
+    
+    // Remove duplicates based on publicKey
+    const uniquePeers = allDiscoveredPeers.filter((peer, index, self) => 
+      index === self.findIndex(p => p.publicKey === peer.publicKey)
+    )
+    
+    console.log('🔍 Total discovered peers:', uniquePeers.length)
+    
+    // Emit the discovery event for components listening to it
+    this.emit('peers:discovered', uniquePeers)
+    
+    return uniquePeers
   }
 
   isFriend(publicKey: string): boolean {
@@ -1126,12 +1466,18 @@ export class FriendService {
   }
 
   getConnectedPeers(): string[] {
-    if (!this.mesh) return []
+    if (!this.mesh) {
+      console.log('❌ getConnectedPeers: Mesh not initialized')
+      return []
+    }
     
     try {
       // Get connected peer IDs from the mesh
       const peers = this.mesh.getPeers()
-      return peers.map((peer: any) => peer.peerId)
+      console.log('🔍 getConnectedPeers: Raw peers from mesh:', peers)
+      const peerIds = peers.map((peer: any) => peer.peerId || peer.id || peer)
+      console.log('🔍 getConnectedPeers: Extracted peer IDs:', peerIds)
+      return peerIds
     } catch (error) {
       console.error('❌ Failed to get connected peers:', error)
       return []
@@ -1152,6 +1498,10 @@ export class FriendService {
       return
     }
 
+    console.log('📤 Attempting to share post:', post.content.substring(0, 50) + '...')
+    console.log('📤 Total friends:', this.friends.length)
+    console.log('📤 Total follows:', this.follows.length)
+
     try {
       const postMessage = {
         type: 'shared_post',
@@ -1159,17 +1509,68 @@ export class FriendService {
         sharedAt: Date.now()
       }
 
-      // Share post with all online friends
+      // Share post with ALL friends (not just online ones for now)
+      let friendsSharedWith = 0
       for (const friend of this.friends) {
-        if (friend.connectionStatus === 'online') {
-          const peerId = friend.publicKey.substring(0, 40)
+        const peerId = friend.publicKey.substring(0, 40)
+        console.log(`📤 Attempting to share with friend ${friend.userInfo.username} (${friend.connectionStatus}):`, peerId)
+        
+        try {
+          await this.mesh.sendDirectMessage(peerId, JSON.stringify(postMessage))
+          console.log('✅ Successfully shared post with friend:', friend.userInfo.username)
+          friendsSharedWith++
+        } catch (error) {
+          console.error('❌ Failed to share post with', friend.userInfo.username, ':', error)
+        }
+      }
+
+      // Share post with followers who are currently connected
+      const connectedPeers = this.getConnectedPeers()
+      console.log('📤 Connected peers for followers:', connectedPeers)
+      
+      let followersSharedWith = 0
+      for (const follow of this.follows) {
+        const peerId = follow.publicKey.substring(0, 40)
+        if (connectedPeers.includes(peerId)) {
           try {
             await this.mesh.sendDirectMessage(peerId, JSON.stringify(postMessage))
-            console.log('📤 Shared post with:', friend.userInfo.username)
+            console.log('✅ Successfully shared post with follower:', follow.userInfo.username)
+            followersSharedWith++
           } catch (error) {
-            console.error('❌ Failed to share post with', friend.userInfo.username, ':', error)
+            console.error('❌ Failed to share post with follower', follow.userInfo.username, ':', error)
           }
+        } else {
+          console.log('📤 Follower not connected:', follow.userInfo.username)
         }
+      }
+      
+      console.log(`📤 Post shared with ${friendsSharedWith} friends and ${followersSharedWith} followers`)
+      
+      // For debugging: if no friends/followers, simulate receiving our own post
+      if (friendsSharedWith === 0 && followersSharedWith === 0) {
+        console.log('🔄 No friends/followers to share with - simulating self-share for testing')
+        setTimeout(() => {
+          try {
+            const currentUser = pigeonSocial.getCurrentUser()
+            currentUser.then(user => {
+              if (user) {
+                this.emit('post:shared', {
+                  post: post,
+                  sharedBy: {
+                    userInfo: {
+                      username: 'test_friend',
+                      displayName: 'Test Friend'
+                    }
+                  },
+                  sharedAt: Date.now()
+                })
+                console.log('🔄 Simulated post share for testing')
+              }
+            })
+          } catch (error) {
+            console.error('❌ Failed to simulate post share:', error)
+          }
+        }, 1000)
       }
     } catch (error) {
       console.error('❌ Failed to share post:', error)
@@ -1462,6 +1863,67 @@ export class FriendService {
     this.cleanupStaleConnections()
   }
 
+  // Follow management methods
+  async followUser(publicKey: string, userInfo: { username: string; displayName: string }): Promise<boolean> {
+    try {
+      // Check if already following
+      if (this.isFollowing(publicKey)) {
+        console.log('👥 Already following user:', userInfo.username)
+        return false
+      }
+
+      // Friends should also be followable for feed purposes
+      const follow: Follow = {
+        publicKey,
+        userInfo: {
+          username: userInfo.username,
+          displayName: userInfo.displayName,
+          publicKey
+        },
+        followedAt: Date.now()
+      }
+
+      this.follows.push(follow)
+      this.persistFollows()
+      
+      console.log('✅ Started following:', userInfo.username)
+      this.emit('follows:updated', this.follows)
+      this.emit('user:followed', follow)
+      
+      return true
+    } catch (error) {
+      console.error('❌ Failed to follow user:', error)
+      return false
+    }
+  }
+
+  unfollowUser(publicKey: string): boolean {
+    const followIndex = this.follows.findIndex(f => f.publicKey === publicKey)
+    if (followIndex === -1) {
+      console.warn('❌ Follow not found for removal:', publicKey.substring(0, 8) + '...')
+      return false
+    }
+
+    const follow = this.follows[followIndex]
+    const userName = follow.userInfo.displayName || follow.userInfo.username
+
+    // Remove from follows list
+    this.follows.splice(followIndex, 1)
+    
+    // Persist the change
+    this.persistFollows()
+    
+    console.log(`🗑️ Unfollowed user: ${userName}`)
+    this.emit('follows:updated', this.follows)
+    this.emit('user:unfollowed', { publicKey, name: userName })
+    
+    return true
+  }
+
+  isFollowing(publicKey: string): boolean {
+    return this.follows.some(f => f.publicKey === publicKey)
+  }
+
   // Remove a friend permanently
   removeFriend(publicKey: string) {
     const friendIndex = this.friends.findIndex(f => f.publicKey === publicKey)
@@ -1503,7 +1965,140 @@ export class FriendService {
     })
     this.emit('friends:updated', this.friends)
   }
+
+  // Debug method to fix existing friends by auto-following them
+  fixExistingFriends() {
+    console.log('🔧 Fixing existing friends by auto-following them...')
+    let addedFollows = 0
+    
+    for (const friend of this.friends) {
+      // Check if we're already following this friend
+      const isAlreadyFollowing = this.follows.some(follow => follow.publicKey === friend.publicKey)
+      
+      if (!isAlreadyFollowing) {
+        const follow: Follow = {
+          publicKey: friend.publicKey,
+          userInfo: {
+            username: friend.userInfo.username,
+            displayName: friend.userInfo.displayName,
+            publicKey: friend.publicKey
+          },
+          followedAt: Date.now()
+        }
+        
+        this.follows.push(follow)
+        addedFollows++
+        console.log('✅ Auto-followed existing friend:', friend.userInfo.username)
+      }
+    }
+    
+    if (addedFollows > 0) {
+      this.persistFollows()
+      this.emit('follows:updated', this.follows)
+      console.log(`🔧 Fixed ${addedFollows} existing friends by auto-following them`)
+    } else {
+      console.log('🔧 No friends needed auto-follow fix')
+    }
+    
+    return addedFollows
+  }
+
+  // Request recent posts from a friend to populate the feed
+  private async requestRecentPostsFromFriend(friendPublicKey: string) {
+    console.log('📤 Requesting recent posts from friend:', friendPublicKey.substring(0, 8) + '...')
+    try {
+      const peerId = this.peerIdMap.get(friendPublicKey)
+      if (!peerId || !this.mesh) {
+        console.log('🔍 Cannot request posts - friend not connected:', friendPublicKey.substring(0, 8) + '...', 'peerId:', peerId, 'mesh:', !!this.mesh)
+        return
+      }
+
+      console.log('📤 Sending post request to peer:', peerId)
+      const request = {
+        type: 'request_recent_posts',
+        requestId: crypto.randomUUID(),
+        timestamp: Date.now()
+      }
+
+      await this.mesh.sendDirectMessage(peerId, JSON.stringify(request))
+      console.log('📤 Post request sent successfully')
+      console.log('📤 Requested recent posts from friend:', friendPublicKey.substring(0, 8) + '...')
+    } catch (error) {
+      console.error('❌ Failed to request posts from friend:', error)
+    }
+  }
+
+  // Handle request for recent posts from a friend
+  private async handlePostRequest(message: any, fromPeerId: string) {
+    try {
+      console.log('📥 Received request for recent posts from:', fromPeerId)
+      
+      const currentUser = await pigeonSocial.getCurrentUser()
+      if (!currentUser) return
+
+      // Get our recent posts
+      const recentPosts = await pigeonSocial.getRecentPostsFromUser(currentUser.publicKey, 5)
+      
+      const response = {
+        type: 'recent_posts_response',
+        requestId: message.requestId,
+        posts: recentPosts,
+        timestamp: Date.now()
+      }
+
+      await this.mesh!.sendDirectMessage(fromPeerId, JSON.stringify(response))
+      console.log('📤 Sent', recentPosts.length, 'recent posts to friend')
+    } catch (error) {
+      console.error('❌ Failed to handle post request:', error)
+    }
+  }
+
+  // Handle response with recent posts from a friend
+  private async handlePostsResponse(message: any, fromPeerId: string) {
+    try {
+      console.log('📥 Received', message.posts?.length || 0, 'posts from friend:', fromPeerId)
+      
+      if (message.posts && message.posts.length > 0) {
+        // Save the friend's posts to our local feed cache
+        for (const post of message.posts) {
+          await pigeonSocial.saveFollowedPost(post)
+        }
+        console.log('💾 Saved friend posts to local feed cache')
+      }
+    } catch (error) {
+      console.error('❌ Failed to handle posts response:', error)
+    }
+  }
+
+  async sharePostWithFriends(post: any): Promise<void> {
+    console.log('📤 Sharing post with all connected friends:', post.id)
+    try {
+      const connectedFriends = this.friends.filter(f => f.connectionStatus === 'online')
+      console.log('📤 Found', connectedFriends.length, 'online friends to share with')
+      
+      for (const friend of connectedFriends) {
+        const peerId = this.peerIdMap.get(friend.publicKey)
+        if (peerId && this.mesh) {
+          const shareMessage = {
+            type: 'shared_post',
+            post: post,
+            timestamp: Date.now()
+          }
+          
+          console.log('📤 Sharing post with friend:', friend.userInfo.displayName, 'peerId:', peerId)
+          await this.mesh.sendDirectMessage(peerId, JSON.stringify(shareMessage))
+        }
+      }
+    } catch (error) {
+      console.error('❌ Failed to share post with friends:', error)
+    }
+  }
 }
 
 // Export singleton instance
 export const friendService = FriendService.getInstance()
+
+// Make it available globally for debugging
+if (typeof window !== 'undefined') {
+  (window as any).friendService = friendService
+}

@@ -1,6 +1,6 @@
 import { useState, useEffect } from 'react'
 import { motion, AnimatePresence } from 'framer-motion'
-import { Plus, MessageCircle, User, Settings, LogOut, Copy, Check, Users } from 'lucide-react'
+import { Plus, MessageCircle, User, Settings, LogOut, Copy, Check, Users, RefreshCw } from 'lucide-react'
 import { pigeonSocial, UserProfile, Post } from '../services/pigeonSocial'
 import { PostCard } from './PostCard'
 import { CreatePost } from './CreatePost'
@@ -20,15 +20,23 @@ export function MainFeed({ user, onLogout }: MainFeedProps) {
   const [showSettings, setShowSettings] = useState(false)
   const [showFriends, setShowFriends] = useState(false)
   const [copiedPublicKey, setCopiedPublicKey] = useState(false)
+  const [isRefreshing, setIsRefreshing] = useState(false)
 
   useEffect(() => {
     loadFeed()
     
-    // Listen for shared posts from friends
-    const handleSharedPost = ({ post, sharedBy }: any) => {
+    // Listen for shared posts from friends and followed users
+    const handleSharedPost = async ({ post, sharedBy }: any) => {
       console.log('📥 MainFeed received shared post from:', sharedBy.userInfo.username)
       
-      // Add shared post to feed with metadata
+      // Save the post to followed posts feed
+      try {
+        await pigeonSocial.saveFollowedPost(post)
+      } catch (error) {
+        console.error('Failed to save followed post:', error)
+      }
+      
+      // Add shared post to current feed with metadata
       const sharedPost = {
         ...post,
         id: `shared_${post.id}_${Date.now()}`, // Create unique ID for shared post
@@ -50,12 +58,55 @@ export function MainFeed({ user, onLogout }: MainFeedProps) {
 
   const loadFeed = async () => {
     try {
+      // Refresh feed to get latest posts from friends/follows
+      await pigeonSocial.refreshFeed()
+      
       const feedPosts = await pigeonSocial.getFeed()
       setPosts(feedPosts)
     } catch (error) {
       console.error('Failed to load feed:', error)
     } finally {
       setIsLoading(false)
+    }
+  }
+
+  const handleRefresh = async () => {
+    try {
+      setIsRefreshing(true)
+      await pigeonSocial.refreshFeed()
+      const feedPosts = await pigeonSocial.getFeed()
+      setPosts(feedPosts)
+    } catch (error) {
+      console.error('Failed to refresh feed:', error)
+    } finally {
+      setIsRefreshing(false)
+    }
+  }
+
+  const getPostAuthor = (post: Post): UserProfile => {
+    // If this is the current user's post
+    if (post.author === user.publicKey) {
+      return user
+    }
+    
+    // If this is a shared post, use the original author info
+    if (post.sharedBy && post.originalAuthor) {
+      return {
+        id: post.originalAuthor,
+        username: post.originalAuthor.substring(0, 8) + '...', // Show truncated public key as username
+        displayName: post.authorName || 'Unknown User',
+        publicKey: post.originalAuthor,
+        createdAt: Date.now()
+      }
+    }
+    
+    // For other posts, create author from post data
+    return {
+      id: post.author,
+      username: post.author.substring(0, 8) + '...', // Show truncated public key as username  
+      displayName: post.authorName || 'Unknown User',
+      publicKey: post.author,
+      createdAt: Date.now()
     }
   }
 
@@ -131,6 +182,16 @@ export function MainFeed({ user, onLogout }: MainFeedProps) {
             <motion.button 
               whileHover={{ scale: 1.1 }}
               whileTap={{ scale: 0.9 }}
+              onClick={handleRefresh}
+              disabled={isRefreshing}
+              className="p-2 text-slate-400 hover:text-white rounded-full hover:bg-slate-600/60 transition-all disabled:opacity-50"
+              title="Refresh Feed"
+            >
+              <RefreshCw className={`w-5 h-5 ${isRefreshing ? 'animate-spin' : ''}`} />
+            </motion.button>
+            <motion.button 
+              whileHover={{ scale: 1.1 }}
+              whileTap={{ scale: 0.9 }}
               onClick={() => setShowFriends(true)}
               className="p-2 text-slate-400 hover:text-white rounded-full hover:bg-slate-600/60 transition-all"
               title="Friends & Network"
@@ -169,6 +230,29 @@ export function MainFeed({ user, onLogout }: MainFeedProps) {
             </span>
           </div>
         </motion.button>
+
+        {/* Debug Panel - Remove in production */}
+        <div className="mb-6 p-4 bg-yellow-50 border border-yellow-200 rounded-lg">
+          <h3 className="font-semibold text-yellow-800 mb-2">Debug Info</h3>
+          <div className="text-sm text-yellow-700 space-y-1">
+            <p>Friends: {friendService.getFriends().length}</p>
+            <p>Follows: {friendService.getFollows().length}</p>
+            <p>Connected to signaling: {friendService.isConnectedToSignaling() ? 'Yes' : 'No'}</p>
+            <p>Posts in feed: {posts.length}</p>
+            <button 
+              onClick={() => {
+                console.log('=== DEBUG INFO ===')
+                console.log('Friends:', friendService.getFriends())
+                console.log('Follows:', friendService.getFollows())
+                console.log('Connected peers:', friendService.getConnectedPeers?.())
+                console.log('Posts:', posts)
+              }}
+              className="mt-2 px-3 py-1 bg-yellow-200 text-yellow-800 rounded text-xs hover:bg-yellow-300"
+            >
+              Log Debug Info
+            </button>
+          </div>
+        </div>
 
         {/* Posts Feed */}
         <div className="space-y-6">
@@ -211,7 +295,8 @@ export function MainFeed({ user, onLogout }: MainFeedProps) {
                 >
                   <PostCard
                     post={post}
-                    author={user}
+                    author={getPostAuthor(post)}
+                    currentUser={user}
                     onLike={() => handleLike(post.id)}
                   />
                 </motion.div>

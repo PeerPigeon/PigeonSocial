@@ -29,7 +29,12 @@ export declare class WebDHT {
 }
 
 export declare class DistributedStorageManager {
-  constructor(options?: any)
+  constructor(mesh: PeerPigeonMesh)
+  store(key: string, value: any, options?: any): Promise<boolean>
+  retrieve(key: string, options?: any): Promise<any>
+  delete(key: string): Promise<boolean>
+  update(key: string, value: any, options?: any): Promise<boolean>
+  waitForCrypto(): Promise<void>
 }
 
 export declare class DebugLogger {

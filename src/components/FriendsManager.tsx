@@ -14,7 +14,8 @@ import {
   Copy,
   Eye,
   EyeOff,
-  Trash2
+  Trash2,
+  Heart
 } from 'lucide-react'
 import { friendService, Friend, FriendRequest } from '../services/friendService'
 import { UserProfile } from '../services/pigeonSocial'
@@ -28,8 +29,9 @@ interface FriendsManagerProps {
 
 export function FriendsManager({ user, onClose }: FriendsManagerProps) {
   const { showSuccess, showError } = useNotifications()
-  const [activeTab, setActiveTab] = useState<'friends' | 'requests' | 'discover' | 'add'>('friends')
+  const [activeTab, setActiveTab] = useState<'friends' | 'follows' | 'requests' | 'discover' | 'add'>('friends')
   const [friends, setFriends] = useState<Friend[]>([])
+  const [follows, setFollows] = useState<any[]>([])
   const [friendRequests, setFriendRequests] = useState<FriendRequest[]>([])
   const [discoveredPeers, setDiscoveredPeers] = useState<any[]>([])
   const [isDiscovering, setIsDiscovering] = useState(false)
@@ -43,6 +45,7 @@ export function FriendsManager({ user, onClose }: FriendsManagerProps) {
   useEffect(() => {
     // Load initial data
     setFriends(friendService.getFriends())
+    setFollows(friendService.getFollows())
     setFriendRequests(friendService.getPendingFriendRequests())
     setIsConnectedToSignaling(friendService.isConnectedToSignaling())
 
@@ -53,6 +56,10 @@ export function FriendsManager({ user, onClose }: FriendsManagerProps) {
 
     friendService.on('friends:updated', () => {
       setFriends(friendService.getFriends())
+    })
+
+    friendService.on('follows:updated', () => {
+      setFollows(friendService.getFollows())
     })
 
     friendService.on('friend-request:received', (_request: FriendRequest) => {
@@ -82,16 +89,24 @@ export function FriendsManager({ user, onClose }: FriendsManagerProps) {
     }
   }, [])
 
-  const handleDiscoverPeers = async () => {
+    const handleDiscoverPeers = async () => {
+    console.log('🔍 FriendsManager: Starting peer discovery...')
     setIsDiscovering(true)
-    const peers = await friendService.discoverPeers()
-    setDiscoveredPeers(peers)
-    setIsDiscovering(false)
+    try {
+      const peers = await friendService.discoverPeers()
+      console.log('🔍 FriendsManager: Discovered peers:', peers)
+      setDiscoveredPeers(peers)
+    } catch (error) {
+      console.error('🔍 FriendsManager: Error discovering peers:', error)
+    } finally {
+      setIsDiscovering(false)
+    }
   }
 
-  const handleSendFriendRequest = async (targetPublicKey: string) => {
+  const handleSendFriendRequest = async (targetPublicKey: string, targetPeerId?: string) => {
+    console.log('📤 FriendsManager: Attempting to send friend request to:', { targetPublicKey, targetPeerId })
     try {
-      await friendService.sendFriendRequest(targetPublicKey, addFriendMessage || undefined)
+      await friendService.sendFriendRequest(targetPublicKey, addFriendMessage || undefined, targetPeerId)
       setAddFriendKey('')
       setAddFriendMessage('')
       showSuccess('Friend request sent!', 'Your friend request has been sent successfully.')
@@ -132,6 +147,31 @@ export function FriendsManager({ user, onClose }: FriendsManagerProps) {
     }
   }
 
+  const handleFollowUser = async (publicKey: string, username: string, displayName: string) => {
+    console.log('👥 FriendsManager: Attempting to follow user:', { publicKey, username, displayName })
+    try {
+      const success = await friendService.followUser(publicKey, { username, displayName })
+      console.log('👥 FriendsManager: Follow result:', success)
+      if (success) {
+        showSuccess('Following user!', `You are now following ${displayName || username}.`)
+      } else {
+        showError('Already following', 'You are already following this user or they are your friend.')
+      }
+    } catch (error) {
+      console.error('Failed to follow user:', error)
+      showError('Failed to follow user', 'Please try again.')
+    }
+  }
+
+  const handleUnfollowUser = (publicKey: string) => {
+    const success = friendService.unfollowUser(publicKey)
+    if (success) {
+      showSuccess('Unfollowed', 'You have unfollowed this user.')
+    } else {
+      showError('Failed to unfollow', 'Could not unfollow this user.')
+    }
+  }
+
   const copyToClipboard = async (text: string) => {
     try {
       await navigator.clipboard.writeText(text)
@@ -144,6 +184,7 @@ export function FriendsManager({ user, onClose }: FriendsManagerProps) {
 
   const tabs = [
     { id: 'friends', label: 'Friends', icon: Users, count: friends.length },
+    { id: 'follows', label: 'Follows', icon: Heart, count: follows.length },
     { id: 'requests', label: 'Requests', icon: UserPlus, count: friendRequests.length },
     { id: 'discover', label: 'Discover', icon: Search, count: discoveredPeers.length },
     { id: 'add', label: 'Add Friend', icon: Key, count: 0 }
@@ -310,6 +351,72 @@ export function FriendsManager({ user, onClose }: FriendsManagerProps) {
               </motion.div>
             )}
 
+            {/* Follows Tab */}
+            {activeTab === 'follows' && (
+              <motion.div
+                key="follows"
+                initial={{ opacity: 0, x: 20 }}
+                animate={{ opacity: 1, x: 0 }}
+                exit={{ opacity: 0, x: -20 }}
+                className="space-y-4"
+              >
+                {follows.length === 0 ? (
+                  <div className="text-center py-12">
+                    <Heart className="w-16 h-16 text-gray-300 mx-auto mb-4" />
+                    <h3 className="text-xl font-semibold text-gray-700 mb-2">No follows yet</h3>
+                    <p className="text-gray-500 mb-6">Follow users to see their posts in your feed without becoming friends</p>
+                    <button
+                      onClick={() => setActiveTab('discover')}
+                      className="btn-primary"
+                    >
+                      Discover Users
+                    </button>
+                  </div>
+                ) : (
+                  follows.map((follow) => (
+                    <motion.div
+                      key={follow.publicKey}
+                      initial={{ opacity: 0, y: 20 }}
+                      animate={{ opacity: 1, y: 0 }}
+                      className="bg-white rounded-xl p-4 shadow-sm border border-gray-100 hover:shadow-md transition-all"
+                    >
+                      <div className="flex items-center justify-between">
+                        <div className="flex items-center gap-4">
+                          <div className="w-12 h-12 bg-gradient-to-r from-pink-500 to-red-600 rounded-full flex items-center justify-center">
+                            <Heart className="w-6 h-6 text-white" />
+                          </div>
+                          <div>
+                            <h4 className="font-semibold text-gray-900">
+                              {follow.userInfo.displayName || follow.userInfo.username}
+                            </h4>
+                            <p className="text-sm text-gray-500">@{follow.userInfo.username}</p>
+                            <p className="text-xs text-gray-400 mt-1">
+                              Following since {new Date(follow.followedAt).toLocaleDateString()}
+                            </p>
+                          </div>
+                        </div>
+                        <div className="flex items-center gap-2">
+                          <button
+                            onClick={() => copyToClipboard(follow.publicKey)}
+                            className="p-2 text-gray-400 hover:text-gray-600 hover:bg-gray-100 rounded-lg transition-all"
+                            title="Copy public key"
+                          >
+                            <Copy className="w-4 h-4" />
+                          </button>
+                          <button
+                            onClick={() => handleUnfollowUser(follow.publicKey)}
+                            className="px-3 py-1 text-red-600 hover:bg-red-50 rounded-lg transition-all text-sm font-medium border border-red-200 hover:border-red-300"
+                          >
+                            Unfollow
+                          </button>
+                        </div>
+                      </div>
+                    </motion.div>
+                  ))
+                )}
+              </motion.div>
+            )}
+
             {/* Friend Requests Tab */}
             {activeTab === 'requests' && (
               <motion.div
@@ -420,44 +527,122 @@ export function FriendsManager({ user, onClose }: FriendsManagerProps) {
                     </p>
                   </div>
                 ) : (
-                  discoveredPeers
-                    .filter(peer => peer.publicKey !== user.publicKey) // Don't show self
-                    .filter(peer => !friendService.isFriend(peer.publicKey)) // Don't show existing friends
-                    .map((peer) => (
-                      <motion.div
-                        key={peer.publicKey}
-                        initial={{ opacity: 0, y: 20 }}
-                        animate={{ opacity: 1, y: 0 }}
-                        className="bg-white rounded-xl p-4 shadow-sm border border-gray-100 hover:shadow-md transition-all"
-                      >
-                        <div className="flex items-center justify-between">
-                          <div className="flex items-center gap-4">
-                            <div className="w-12 h-12 bg-gradient-to-r from-purple-500 to-pink-600 rounded-full flex items-center justify-center">
-                              <Users className="w-6 h-6 text-white" />
-                            </div>
-                            <div>
-                              <h4 className="font-semibold text-gray-900">
-                                {peer.userInfo?.displayName || peer.userInfo?.username || 'Unknown User'}
-                              </h4>
-                              {peer.userInfo?.username && (
-                                <p className="text-sm text-gray-500">@{peer.userInfo.username}</p>
-                              )}
-                              <div className="flex items-center gap-2 mt-1 text-xs text-gray-400">
-                                <div className="w-2 h-2 bg-green-500 rounded-full" />
-                                Online now
+                  <>
+                    {/* Show discovered peers (exclude self, but include friends for follow options) */}
+                    {discoveredPeers
+                      .filter(peer => peer.publicKey !== user.publicKey) // Don't show self
+                      .map((peer) => (
+                        <motion.div
+                          key={peer.publicKey}
+                          initial={{ opacity: 0, y: 20 }}
+                          animate={{ opacity: 1, y: 0 }}
+                          className="bg-white rounded-xl p-4 shadow-sm border border-gray-100 hover:shadow-md transition-all"
+                        >
+                          <div className="flex items-center justify-between">
+                            <div className="flex items-center gap-4">
+                              <div className="w-12 h-12 bg-gradient-to-r from-purple-500 to-pink-600 rounded-full flex items-center justify-center">
+                                <Users className="w-6 h-6 text-white" />
+                              </div>
+                              <div>
+                                <h4 className="font-semibold text-gray-900">
+                                  {peer.userInfo?.displayName || peer.userInfo?.username || 'Unknown User'}
+                                </h4>
+                                {peer.userInfo?.username && (
+                                  <p className="text-sm text-gray-500">@{peer.userInfo.username}</p>
+                                )}
+                                <div className="flex items-center gap-4 mt-1 text-xs">
+                                  <div className="flex items-center gap-1 text-green-600">
+                                    <div className="w-2 h-2 bg-green-500 rounded-full" />
+                                    Online now
+                                  </div>
+                                  {friendService.isFriend(peer.publicKey) && (
+                                    <span className="bg-blue-100 text-blue-600 px-2 py-0.5 rounded-full text-xs font-medium">
+                                      Friend
+                                    </span>
+                                  )}
+                                </div>
                               </div>
                             </div>
+                            <div className="flex items-center gap-2">
+                              <button
+                                onClick={() => handleFollowUser(
+                                  peer.publicKey, 
+                                  peer.userInfo?.username || 'Unknown',
+                                  peer.userInfo?.displayName || peer.userInfo?.username || 'Unknown User'
+                                )}
+                                disabled={friendService.isFollowing(peer.publicKey)}
+                                className="px-3 py-1 text-pink-600 hover:bg-pink-50 rounded-lg transition-all text-sm font-medium border border-pink-200 hover:border-pink-300 disabled:opacity-50 disabled:cursor-not-allowed flex items-center gap-1"
+                              >
+                                <Heart className="w-3 h-3" />
+                                {friendService.isFollowing(peer.publicKey) ? 'Following' : 'Follow'}
+                              </button>
+                              {!friendService.isFriend(peer.publicKey) && (
+                                <button
+                                  onClick={() => handleSendFriendRequest(peer.publicKey, peer.peerId)}
+                                  className="btn-primary text-sm flex items-center gap-2"
+                                >
+                                  <UserPlus className="w-4 h-4" />
+                                  Add Friend
+                                </button>
+                              )}
+                            </div>
                           </div>
-                          <button
-                            onClick={() => handleSendFriendRequest(peer.publicKey)}
-                            className="btn-primary text-sm flex items-center gap-2"
-                          >
-                            <UserPlus className="w-4 h-4" />
-                            Add Friend
-                          </button>
-                        </div>
-                      </motion.div>
-                    ))
+                        </motion.div>
+                      ))}
+                    
+                    {/* Show existing friends who are not in discovered peers yet */}
+                    {friends
+                      .filter(friend => !discoveredPeers.some(peer => peer.publicKey === friend.publicKey))
+                      .map((friend) => (
+                        <motion.div
+                          key={friend.publicKey}
+                          initial={{ opacity: 0, y: 20 }}
+                          animate={{ opacity: 1, y: 0 }}
+                          className="bg-white rounded-xl p-4 shadow-sm border border-gray-100 hover:shadow-md transition-all"
+                        >
+                          <div className="flex items-center justify-between">
+                            <div className="flex items-center gap-4">
+                              <div className="w-12 h-12 bg-gradient-to-r from-blue-500 to-purple-600 rounded-full flex items-center justify-center">
+                                <Users className="w-6 h-6 text-white" />
+                              </div>
+                              <div>
+                                <h4 className="font-semibold text-gray-900">
+                                  {friend.userInfo.displayName || friend.userInfo.username}
+                                </h4>
+                                <p className="text-sm text-gray-500">@{friend.userInfo.username}</p>
+                                <div className="flex items-center gap-4 mt-1 text-xs">
+                                  <div className={`flex items-center gap-1 ${
+                                    friend.connectionStatus === 'online' ? 'text-green-600' : 'text-gray-500'
+                                  }`}>
+                                    <div className={`w-2 h-2 rounded-full ${
+                                      friend.connectionStatus === 'online' ? 'bg-green-500' : 'bg-gray-400'
+                                    }`} />
+                                    {friend.connectionStatus === 'online' ? 'Online' : 'Offline'}
+                                  </div>
+                                  <span className="bg-blue-100 text-blue-600 px-2 py-0.5 rounded-full text-xs font-medium">
+                                    Friend
+                                  </span>
+                                </div>
+                              </div>
+                            </div>
+                            <div className="flex items-center gap-2">
+                              <button
+                                onClick={() => handleFollowUser(
+                                  friend.publicKey, 
+                                  friend.userInfo.username,
+                                  friend.userInfo.displayName || friend.userInfo.username
+                                )}
+                                disabled={friendService.isFollowing(friend.publicKey)}
+                                className="px-3 py-1 text-pink-600 hover:bg-pink-50 rounded-lg transition-all text-sm font-medium border border-pink-200 hover:border-pink-300 disabled:opacity-50 disabled:cursor-not-allowed flex items-center gap-1"
+                              >
+                                <Heart className="w-3 h-3" />
+                                {friendService.isFollowing(friend.publicKey) ? 'Following' : 'Follow'}
+                              </button>
+                            </div>
+                          </div>
+                        </motion.div>
+                      ))}
+                  </>
                 )}
               </motion.div>
             )}
@@ -517,14 +702,28 @@ export function FriendsManager({ user, onClose }: FriendsManagerProps) {
                     </p>
                   </div>
 
-                  <button
-                    onClick={() => handleSendFriendRequest(addFriendKey)}
-                    disabled={!addFriendKey.trim() || !isConnectedToSignaling}
-                    className="btn-primary w-full flex items-center justify-center gap-2"
-                  >
-                    <Send className="w-4 h-4" />
-                    Send Friend Request
-                  </button>
+                  <div className="flex gap-3">
+                    <button
+                      onClick={() => handleFollowUser(
+                        addFriendKey, 
+                        'Unknown',
+                        'Unknown User'
+                      )}
+                      disabled={!addFriendKey.trim() || friendService.isFollowing(addFriendKey)}
+                      className="flex-1 px-4 py-3 text-pink-600 hover:bg-pink-50 rounded-xl transition-all font-medium border border-pink-200 hover:border-pink-300 disabled:opacity-50 disabled:cursor-not-allowed flex items-center justify-center gap-2"
+                    >
+                      <Heart className="w-4 h-4" />
+                      {friendService.isFollowing(addFriendKey) ? 'Following' : 'Follow User'}
+                    </button>
+                    <button
+                      onClick={() => handleSendFriendRequest(addFriendKey)}
+                      disabled={!addFriendKey.trim() || !isConnectedToSignaling}
+                      className="btn-primary flex-1 flex items-center justify-center gap-2"
+                    >
+                      <Send className="w-4 h-4" />
+                      Send Friend Request
+                    </button>
+                  </div>
                 </div>
 
                 <div className="mt-8 p-4 bg-blue-50 rounded-xl">
