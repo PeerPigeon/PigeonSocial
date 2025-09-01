@@ -68,7 +68,7 @@ export class PigeonSocialService {
     try {
       // Simple initialization like wt.js - just create the client with proper config
       if ((window as any).WebTorrent) {
-        // Configure WebTorrent with proper STUN servers like wt.js
+        // Configure WebTorrent with proper STUN servers and disable autoplay
         const webTorrentConfig = {
           tracker: {
             rtcConfig: {
@@ -77,7 +77,9 @@ export class PigeonSocialService {
                 { urls: 'stun:stun1.l.google.com:19302' }
               ]
             }
-          }
+          },
+          // Disable autoplay at the WebTorrent level
+          autoplay: false
         }
         
         this.webtorrentClient = new (window as any).WebTorrent(webTorrentConfig)
@@ -95,7 +97,9 @@ export class PigeonSocialService {
                     { urls: 'stun:stun1.l.google.com:19302' }
                   ]
                 }
-              }
+              },
+              // Disable autoplay at the WebTorrent level
+              autoplay: false
             }
             
             this.webtorrentClient = new (window as any).WebTorrent(webTorrentConfig)
@@ -843,6 +847,8 @@ export class PigeonSocialService {
   }
 
   async addTorrentFromMagnet(magnetURI: string): Promise<void> {
+    console.log('📥 addTorrentFromMagnet: FULL magnet URI:', magnetURI)
+    
     if (!this.webtorrentClient) {
       throw new Error('WebTorrent client not initialized')
     }
@@ -850,42 +856,51 @@ export class PigeonSocialService {
     // Check if we already have this torrent
     const existingTorrent = this.webtorrentClient.get(magnetURI)
     if (existingTorrent) {
-      console.log('📥 Torrent already exists:', existingTorrent.infoHash)
-      // Always return immediately if torrent exists - don't destroy it
-      return
+      console.log('📥 Torrent already exists:', existingTorrent.infoHash, 'for magnet:', magnetURI)
+      
+      // If the torrent exists but has no files, it might be broken - destroy and re-add
+      if (existingTorrent.ready && (!existingTorrent.files || existingTorrent.files.length === 0)) {
+        console.log('🔧 Existing torrent is ready but broken, destroying and re-adding...')
+        existingTorrent.destroy()
+        this.activeTorrents.delete(existingTorrent.infoHash)
+        // Continue to add it again
+      } else {
+        // Torrent exists and is either working or still initializing
+        console.log('📥 Using existing torrent')
+        return
+      }
     }
 
-    console.log('📥 Adding torrent from magnet URI:', magnetURI.substring(0, 50) + '...')
+    console.log('📥 Adding/downloading torrent from magnet URI:', magnetURI.substring(0, 50) + '...')
 
     return new Promise((resolve, reject) => {
       this.webtorrentClient.add(magnetURI, (torrent: any) => {
         const infoHash = torrent.infoHash
         
-        // Store torrent info immediately - don't wait for files
-        if (!this.activeTorrents.has(infoHash)) {
-          this.activeTorrents.set(infoHash, {
-            magnetURI,
-            fileName: torrent.name,
-            fileSize: torrent.length,
-            createdAt: new Date()
-          })
-        }
-
         console.log('✅ Torrent added successfully:', {
           infoHash: infoHash.substring(0, 16) + '...',
-          fileName: torrent.name,
+          fileName: torrent.name || 'Unknown',
           files: torrent.files?.length || 0,
           ready: torrent.ready
         })
         
-        // Resolve immediately - don't wait for ready state
+        // Store torrent info
+        if (!this.activeTorrents.has(infoHash)) {
+          this.activeTorrents.set(infoHash, {
+            magnetURI,
+            fileName: torrent.name || 'Unknown',
+            fileSize: torrent.length || 0,
+            createdAt: new Date()
+          })
+        }
+        
         resolve()
       })
 
-      // Longer timeout for adding the torrent
+      // Longer timeout for downloading from peers
       setTimeout(() => {
-        reject(new Error('Torrent download timeout - video not available in P2P network'))
-      }, 30000) // Back to 30 second timeout
+        reject(new Error('Torrent add/download timeout - no peers available'))
+      }, 45000) // 45 second timeout for downloading
     })
   }
 
@@ -950,6 +965,8 @@ export class PigeonSocialService {
 
   // Get the actual video file for direct streaming - EXACTLY like wt.js
   getVideoFile(magnetURI: string): any | null {
+    console.log('🎥 getVideoFile: FULL magnet URI:', magnetURI)
+    
     if (!this.webtorrentClient) {
       console.log('🎥 getVideoFile: WebTorrent client not initialized')
       return null
@@ -957,11 +974,13 @@ export class PigeonSocialService {
 
     const torrent = this.webtorrentClient.get(magnetURI)
     if (!torrent) {
-      console.log('🎥 getVideoFile: Torrent not found in client')
+      console.log('🎥 getVideoFile: Torrent not found in client for magnet:', magnetURI)
       return null
     }
 
     console.log('🎥 getVideoFile: Torrent found, ready:', torrent.ready, 'files:', torrent.files?.length || 0)
+    console.log('🎥 getVideoFile: Torrent progress:', torrent.progress, 'downloaded:', torrent.downloaded, 'uploaded:', torrent.uploaded)
+    console.log('🎥 getVideoFile: Torrent peers:', torrent.numPeers, 'wire count:', torrent.wires?.length || 0)
 
     // Don't destroy torrents that are still initializing!
     // Only destroy if it's been ready for a while but still has no files
@@ -985,9 +1004,13 @@ export class PigeonSocialService {
     )
 
     if (videoFile) {
-      console.log('🎥 getVideoFile: Found video file:', videoFile.name, 'length:', videoFile.length)
+      console.log('🎥 getVideoFile: Found video file:', videoFile.name, 'length:', videoFile.length, 'downloaded:', videoFile.downloaded)
+      console.log('🎥 getVideoFile: Video file methods available:', Object.getOwnPropertyNames(Object.getPrototypeOf(videoFile)))
     } else {
       console.log('🎥 getVideoFile: No video file found in torrent files')
+      if (torrent.files?.length > 0) {
+        console.log('🎥 getVideoFile: Available files:', torrent.files.map((f: any) => f.name))
+      }
     }
 
     return videoFile || null
