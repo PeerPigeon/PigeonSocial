@@ -14,6 +14,7 @@ interface MessagingProps {
 interface Message {
   id: string
   content: string
+  image?: string // Base64 encoded image data
   timestamp: number
   fromSelf: boolean
   encrypted?: boolean
@@ -23,6 +24,7 @@ export function Messaging({ user, friend, onClose }: MessagingProps) {
   const { showError } = useNotifications()
   const [messages, setMessages] = useState<Message[]>([])
   const [newMessage, setNewMessage] = useState('')
+  const [messageImage, setMessageImage] = useState<string | null>(null)
   const [isSending, setIsSending] = useState(false)
   const [isConnected, setIsConnected] = useState(false)
   const messagesEndRef = useRef<HTMLDivElement>(null)
@@ -52,6 +54,7 @@ export function Messaging({ user, friend, onClose }: MessagingProps) {
         const uiMessages: Message[] = chatMessages.map(msg => ({
           id: msg.id,
           content: typeof msg.content === 'string' ? msg.content : '[Encrypted Message]',
+          image: msg.image,
           timestamp: msg.timestamp,
           fromSelf: msg.fromPublicKey === user.publicKey,
           encrypted: msg.encrypted || false
@@ -72,6 +75,7 @@ export function Messaging({ user, friend, onClose }: MessagingProps) {
         const newMsg: Message = {
           id: crypto.randomUUID(),
           content: message.content || message.data,
+          image: message.image,
           timestamp: message.timestamp || Date.now(),
           fromSelf: false,
           encrypted: message.encrypted
@@ -112,7 +116,7 @@ export function Messaging({ user, friend, onClose }: MessagingProps) {
   }, [friend.publicKey, friend.userInfo.username])
 
   const handleSendMessage = async () => {
-    if (!newMessage.trim() || isSending) return
+    if (!newMessage.trim() && !messageImage || isSending) return
 
     setIsSending(true)
     
@@ -123,13 +127,14 @@ export function Messaging({ user, friend, onClose }: MessagingProps) {
       const newMsg: Message = {
         id: crypto.randomUUID(),
         content: message,
+        image: messageImage || undefined,
         timestamp: Date.now(),
         fromSelf: true
       }
       setMessages(prev => [...prev, newMsg])
       
       // Send message (this will queue it if friend is offline)
-      const success = await friendService.sendMessageToFriend(friend.publicKey, message)
+      const success = await friendService.sendMessageToFriend(friend.publicKey, message, messageImage || undefined)
       
       if (!success && !isConnected) {
         // Message was queued for offline delivery - show a subtle indicator
@@ -137,11 +142,34 @@ export function Messaging({ user, friend, onClose }: MessagingProps) {
       }
       
       setNewMessage('')
+      setMessageImage(null)
     } catch (error) {
       console.error('Failed to send message:', error)
       showError('Failed to send message', 'Please try again.')
     } finally {
       setIsSending(false)
+    }
+  }
+
+  const handleMessagePaste = async (e: React.ClipboardEvent) => {
+    const items = e.clipboardData?.items
+    if (!items) return
+
+    for (let i = 0; i < items.length; i++) {
+      const item = items[i]
+      if (item.type.indexOf('image') !== -1) {
+        e.preventDefault()
+        const file = item.getAsFile()
+        if (file) {
+          const reader = new FileReader()
+          reader.onload = (event) => {
+            const base64 = event.target?.result as string
+            setMessageImage(base64)
+          }
+          reader.readAsDataURL(file)
+        }
+        break
+      }
     }
   }
 
@@ -225,6 +253,13 @@ export function Messaging({ user, friend, onClose }: MessagingProps) {
                     ? 'bg-gradient-to-r from-indigo-500 to-purple-600 text-white' 
                     : 'bg-slate-700 text-slate-100 border border-slate-600'
                 }`}>
+                  {message.image && (
+                    <img
+                      src={message.image}
+                      alt="Message image"
+                      className="max-w-full max-h-48 rounded mb-2 border border-slate-500"
+                    />
+                  )}
                   <p className="text-sm leading-relaxed">
                     {typeof message.content === 'string' 
                       ? message.content 
@@ -259,11 +294,27 @@ export function Messaging({ user, friend, onClose }: MessagingProps) {
 
         {/* Message Input */}
         <div className="p-4 bg-slate-800 border-t border-slate-700/50">
+          {messageImage && (
+            <div className="mb-3 relative">
+              <img
+                src={messageImage}
+                alt="Message image"
+                className="max-w-full max-h-32 rounded border border-slate-600"
+              />
+              <button
+                onClick={() => setMessageImage(null)}
+                className="absolute top-1 right-1 bg-red-500 text-white rounded-full w-5 h-5 flex items-center justify-center text-xs hover:bg-red-600"
+              >
+                ×
+              </button>
+            </div>
+          )}
           <div className="flex gap-3">
             <input
               type="text"
               value={newMessage}
               onChange={(e) => setNewMessage(e.target.value)}
+              onPaste={handleMessagePaste}
               onKeyPress={handleKeyPress}
               placeholder={isConnected ? "Type a message..." : "Type a message (will be delivered when online)..."}
               disabled={isSending}
@@ -271,7 +322,7 @@ export function Messaging({ user, friend, onClose }: MessagingProps) {
             />
             <button
               onClick={handleSendMessage}
-              disabled={!newMessage.trim() || isSending}
+              disabled={!(newMessage.trim() || messageImage) || isSending}
               className="bg-gradient-to-r from-indigo-500 to-purple-600 hover:from-indigo-600 hover:to-purple-700 text-white rounded-xl px-4 py-3 disabled:opacity-50 disabled:cursor-not-allowed transition-all duration-200 shadow-lg hover:shadow-xl flex items-center justify-center min-w-[50px]"
             >
               {isSending ? (

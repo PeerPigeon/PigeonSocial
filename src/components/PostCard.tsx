@@ -3,6 +3,7 @@ import { Heart, MessageCircle, Share, User, UserPlus, Info, Send } from 'lucide-
 import { Post, UserProfile, pigeonSocial } from '../services/pigeonSocial'
 import { friendService } from '../services/friendService'
 import { useState, useEffect } from 'react'
+import VideoPlayer from './VideoPlayer'
 
 interface PostCardProps {
   post: Post & { 
@@ -20,6 +21,7 @@ export function PostCard({ post, author, currentUser, onLike, onUpdate }: PostCa
   const [showComments, setShowComments] = useState(false)
   const [comments, setComments] = useState<Post[]>(post.comments || [])
   const [newComment, setNewComment] = useState('')
+  const [commentImage, setCommentImage] = useState<string | null>(null)
   const [isAddingComment, setIsAddingComment] = useState(false)
   
   // Sync comments when post prop changes
@@ -64,7 +66,7 @@ export function PostCard({ post, author, currentUser, onLike, onUpdate }: PostCa
   }
 
   const handleAddComment = async () => {
-    if (!newComment.trim() || isAddingComment) return
+    if (!newComment.trim() && !commentImage || isAddingComment) return
 
     setIsAddingComment(true)
     try {
@@ -77,26 +79,47 @@ export function PostCard({ post, author, currentUser, onLike, onUpdate }: PostCa
         commentsLength: post.comments?.length || 0
       })
       
-      const updatedPost = await pigeonSocial.addComment(post.id, newComment.trim())
+      await pigeonSocial.addComment(post.id, newComment.trim())
       
-      if (updatedPost) {
-        // Update local comments state
-        setComments(updatedPost.comments || [])
-        setNewComment('')
-        
-        // Notify parent component of the update
-        if (onUpdate) {
-          onUpdate(updatedPost)
-        }
-        
-        console.log('✅ Comment added successfully')
-      } else {
-        console.error('❌ Failed to add comment - no updated post returned')
+      // addComment doesn't return the post, so we need to get the updated comments
+      const updatedComments = await pigeonSocial.getComments(post.id)
+      setComments(updatedComments)
+      setNewComment('')
+      setCommentImage(null)
+      
+      // Notify parent component of the update
+      if (onUpdate) {
+        const updatedPostData = { ...post, comments: updatedComments }
+        onUpdate(updatedPostData)
       }
+      
+      console.log('✅ Comment added successfully')
     } catch (error) {
       console.error('❌ Failed to add comment:', error)
     } finally {
       setIsAddingComment(false)
+    }
+  }
+
+  const handleCommentPaste = async (e: React.ClipboardEvent) => {
+    const items = e.clipboardData?.items
+    if (!items) return
+
+    for (let i = 0; i < items.length; i++) {
+      const item = items[i]
+      if (item.type.indexOf('image') !== -1) {
+        e.preventDefault()
+        const file = item.getAsFile()
+        if (file) {
+          const reader = new FileReader()
+          reader.onload = (event) => {
+            const base64 = event.target?.result as string
+            setCommentImage(base64)
+          }
+          reader.readAsDataURL(file)
+        }
+        break
+      }
     }
   }
 
@@ -188,6 +211,21 @@ export function PostCard({ post, author, currentUser, onLike, onUpdate }: PostCa
         <p className="text-gray-900 leading-relaxed whitespace-pre-wrap text-lg">
           {post.content}
         </p>
+        {post.image && (
+          <img
+            src={post.image}
+            alt="Post image"
+            className="mt-4 max-w-full max-h-96 rounded-lg border border-gray-200"
+          />
+        )}
+        {post.video && (
+          <div className="mt-4">
+            <VideoPlayer
+              postId={post.id}
+              magnetURI={post.video}
+            />
+          </div>
+        )}
       </div>
 
       {/* Post Actions */}
@@ -247,17 +285,33 @@ export function PostCard({ post, author, currentUser, onLike, onUpdate }: PostCa
                     type="text"
                     value={newComment}
                     onChange={(e) => setNewComment(e.target.value)}
+                    onPaste={handleCommentPaste}
                     onKeyPress={handleKeyPress}
                     placeholder="Add a comment..."
                     disabled={isAddingComment}
                     className="w-full px-3 py-2 border border-gray-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent disabled:opacity-50"
                   />
+                  {commentImage && (
+                    <div className="mt-2 relative">
+                      <img
+                        src={commentImage}
+                        alt="Comment image"
+                        className="max-w-full max-h-32 rounded border border-gray-300"
+                      />
+                      <button
+                        onClick={() => setCommentImage(null)}
+                        className="absolute top-1 right-1 bg-red-500 text-white rounded-full w-5 h-5 flex items-center justify-center text-xs hover:bg-red-600"
+                      >
+                        ×
+                      </button>
+                    </div>
+                  )}
                 </div>
                 <motion.button
                   whileHover={{ scale: 1.05 }}
                   whileTap={{ scale: 0.95 }}
                   onClick={handleAddComment}
-                  disabled={!newComment.trim() || isAddingComment}
+                  disabled={!(newComment.trim() || commentImage) || isAddingComment}
                   className="px-4 py-2 bg-blue-500 text-white rounded-lg hover:bg-blue-600 disabled:opacity-50 disabled:cursor-not-allowed transition-colors flex items-center gap-2"
                 >
                   {isAddingComment ? (
@@ -293,6 +347,13 @@ export function PostCard({ post, author, currentUser, onLike, onUpdate }: PostCa
                     <p className="text-sm text-gray-700 leading-relaxed">
                       {comment.content}
                     </p>
+                    {comment.image && (
+                      <img
+                        src={comment.image}
+                        alt="Comment image"
+                        className="mt-2 max-w-full max-h-32 rounded border border-gray-300"
+                      />
+                    )}
                   </div>
                 </motion.div>
               ))}

@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useState, useRef } from 'react'
 import { motion } from 'framer-motion'
 import { X, Send, User } from 'lucide-react'
 import { pigeonSocial, UserProfile, Post } from '../services/pigeonSocial'
@@ -14,29 +14,65 @@ interface CreatePostProps {
 export function CreatePost({ user, onClose, onPostCreated }: CreatePostProps) {
   const { showError } = useNotifications()
   const [content, setContent] = useState('')
+  const [image, setImage] = useState<string | null>(null)
+  const [videoFile, setVideoFile] = useState<File | null>(null)
   const [isSubmitting, setIsSubmitting] = useState(false)
+  const videoInputRef = useRef<HTMLInputElement>(null)
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault()
     
-    if (!content.trim() || isSubmitting) return
+    if (!content.trim() && !image && !videoFile || isSubmitting) return
 
     setIsSubmitting(true)
     
     try {
-      const post = await pigeonSocial.createPost(content.trim())
+      const post = await pigeonSocial.createPost(content.trim(), image || undefined, videoFile || undefined)
       onPostCreated(post)
       
       // Share the post with friends
       await friendService.sharePost(post)
       
       setContent('')
+      setImage(null)
+      setVideoFile(null)
       onClose()
     } catch (error) {
       console.error('Failed to create post:', error)
       showError('Failed to create post', 'Please try again.')
     } finally {
       setIsSubmitting(false)
+    }
+  }
+
+  const handlePaste = async (e: React.ClipboardEvent) => {
+    const items = e.clipboardData?.items
+    if (!items) return
+
+    for (let i = 0; i < items.length; i++) {
+      const item = items[i]
+      if (item.type.indexOf('image') !== -1) {
+        e.preventDefault()
+        const file = item.getAsFile()
+        if (file) {
+          const reader = new FileReader()
+          reader.onload = (event) => {
+            const base64 = event.target?.result as string
+            setImage(base64)
+            setVideoFile(null) // Clear video if image is pasted
+          }
+          reader.readAsDataURL(file)
+        }
+        break
+      } else if (item.type.indexOf('video') !== -1) {
+        e.preventDefault()
+        const file = item.getAsFile()
+        if (file) {
+          setVideoFile(file)
+          setImage(null) // Clear image if video is pasted
+        }
+        break
+      }
     }
   }
 
@@ -82,12 +118,46 @@ export function CreatePost({ user, onClose, onPostCreated }: CreatePostProps) {
               <textarea
                 value={content}
                 onChange={(e) => setContent(e.target.value)}
+                onPaste={handlePaste}
                 placeholder="What's happening?"
                 className="w-full resize-none border-none outline-none text-lg placeholder-gray-500 min-h-[140px] bg-transparent"
                 maxLength={maxLength}
                 autoFocus
                 disabled={isSubmitting}
               />
+              {image && (
+                <div className="mt-4 relative">
+                  <img
+                    src={image}
+                    alt="Pasted image"
+                    className="max-w-full max-h-64 rounded-lg border border-gray-300"
+                  />
+                  <button
+                    onClick={() => setImage(null)}
+                    className="absolute top-2 right-2 bg-red-500 text-white rounded-full w-6 h-6 flex items-center justify-center text-sm hover:bg-red-600"
+                  >
+                    ×
+                  </button>
+                </div>
+              )}
+              {videoFile && (
+                <div className="mt-4 relative">
+                  <video
+                    src={URL.createObjectURL(videoFile)}
+                    controls
+                    className="max-w-full max-h-64 rounded-lg border border-gray-300"
+                  />
+                  <button
+                    onClick={() => setVideoFile(null)}
+                    className="absolute top-2 right-2 bg-red-500 text-white rounded-full w-6 h-6 flex items-center justify-center text-sm hover:bg-red-600"
+                  >
+                    ×
+                  </button>
+                  <div className="mt-2 text-sm text-gray-600">
+                    Video: {videoFile.name} ({(videoFile.size / (1024 * 1024)).toFixed(1)} MB)
+                  </div>
+                </div>
+              )}
             </div>
           </div>
 
@@ -121,6 +191,56 @@ export function CreatePost({ user, onClose, onPostCreated }: CreatePostProps) {
                   />
                 </div>
               )}
+              
+              {/* File Upload Buttons */}
+              <div className="flex gap-2">
+                <label className="cursor-pointer text-blue-500 hover:text-blue-600 text-sm font-medium">
+                  <input
+                    type="file"
+                    accept="image/*"
+                    onChange={(e) => {
+                      const file = e.target.files?.[0]
+                      if (file) {
+                        const reader = new FileReader()
+                        reader.onload = (event) => {
+                          const base64 = event.target?.result as string
+                          setImage(base64)
+                          setVideoFile(null)
+                        }
+                        reader.readAsDataURL(file)
+                      }
+                    }}
+                    className="hidden"
+                  />
+                  📷 Image
+                </label>
+                <input
+                  ref={videoInputRef}
+                  type="file"
+                  accept="video/*"
+                  onChange={(e) => {
+                    console.log('Video file input changed', e.target.files)
+                    const file = e.target.files?.[0]
+                    if (file) {
+                      console.log('Video file selected:', file.name, file.size)
+                      setVideoFile(file)
+                      setImage(null)
+                    }
+                  }}
+                  className="hidden"
+                />
+                <button
+                  type="button"
+                  className="cursor-pointer text-purple-500 hover:text-purple-600 text-sm font-medium"
+                  onClick={(e) => {
+                    e.preventDefault()
+                    console.log('Video button clicked, triggering input')
+                    videoInputRef.current?.click()
+                  }}
+                >
+                  🎥 Video
+                </button>
+              </div>
             </div>
             
             <div className="flex gap-3">
@@ -134,10 +254,10 @@ export function CreatePost({ user, onClose, onPostCreated }: CreatePostProps) {
               </button>
               <motion.button
                 type="submit"
-                whileHover={{ scale: content.trim() && !isSubmitting ? 1.05 : 1 }}
-                whileTap={{ scale: content.trim() && !isSubmitting ? 0.95 : 1 }}
+                whileHover={{ scale: (content.trim() || image || videoFile) && !isSubmitting ? 1.05 : 1 }}
+                whileTap={{ scale: (content.trim() || image || videoFile) && !isSubmitting ? 0.95 : 1 }}
                 className="btn-primary flex items-center gap-2"
-                disabled={!content.trim() || isSubmitting}
+                disabled={!(content.trim() || image || videoFile) || isSubmitting}
               >
                 {isSubmitting ? (
                   <>

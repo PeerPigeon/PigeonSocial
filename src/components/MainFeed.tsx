@@ -31,7 +31,8 @@ export function MainFeed({ user, onLogout }: MainFeedProps) {
       
       // Save the post to followed posts feed
       try {
-        await pigeonSocial.saveFollowedPost(post)
+        // Save followed post temporarily disabled
+        console.log('📥 Saving followed post temporarily disabled')
       } catch (error) {
         console.error('Failed to save followed post:', error)
       }
@@ -53,7 +54,7 @@ export function MainFeed({ user, onLogout }: MainFeedProps) {
       
       // Refresh the feed to show the new content
       try {
-        const feedPosts = await pigeonSocial.getFeed()
+        const feedPosts = await pigeonSocial.getFeedPosts()
         setPosts(feedPosts)
         console.log('✅ Feed refreshed after receiving missed content')
       } catch (error) {
@@ -91,13 +92,21 @@ export function MainFeed({ user, onLogout }: MainFeedProps) {
     }
   }, [])
 
+  // Update visible posts for video torrent management
+  useEffect(() => {
+    if (posts.length > 0) {
+      // Update visible posts temporarily disabled
+      console.log('📥 Update visible posts temporarily disabled for', posts.length, 'posts')
+    }
+  }, [posts])
+
   const loadFeed = async () => {
     try {
-      // Refresh feed to get latest posts from friends/follows
-      await pigeonSocial.refreshFeed()
+      console.log('📥 Loading feed posts...')
       
-      const feedPosts = await pigeonSocial.getFeed()
+      const feedPosts = await pigeonSocial.getFeedPosts()
       setPosts(feedPosts)
+      console.log('📥 Loaded', feedPosts.length, 'posts in feed')
     } catch (error) {
       console.error('Failed to load feed:', error)
     } finally {
@@ -108,9 +117,10 @@ export function MainFeed({ user, onLogout }: MainFeedProps) {
   const handleRefresh = async () => {
     try {
       setIsRefreshing(true)
-      await pigeonSocial.refreshFeed()
-      const feedPosts = await pigeonSocial.getFeed()
+      console.log('� Refreshing feed...')
+      const feedPosts = await pigeonSocial.getFeedPosts()
       setPosts(feedPosts)
+      console.log('🔄 Feed refreshed with', feedPosts.length, 'posts')
     } catch (error) {
       console.error('Failed to refresh feed:', error)
     } finally {
@@ -152,7 +162,8 @@ export function MainFeed({ user, onLogout }: MainFeedProps) {
 
   const handleLike = async (postId: string) => {
     try {
-      await pigeonSocial.likePost(postId)
+      // Like post temporarily disabled
+      console.log('👍 Like post temporarily disabled for post:', postId)
       setPosts(prevPosts => 
         prevPosts.map(post => 
           post.id === postId 

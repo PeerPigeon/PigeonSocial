@@ -47,9 +47,20 @@ export default defineConfig({
   ],
   define: {
     global: 'globalThis',
+    process: { env: {} },
+  },
+  resolve: {
+    alias: {
+      buffer: 'buffer',
+      process: 'process/browser',
+      util: 'util',
+      stream: 'stream-browserify',
+      crypto: 'crypto-browserify',
+    },
   },
   optimizeDeps: {
-    exclude: ['peerpigeon', 'peerpigeon/server']
+    exclude: ['peerpigeon', 'peerpigeon/server', 'webtorrent'],
+    include: []
   },
   server: {
     host: true,

@@ -19,6 +19,7 @@ export interface Friend {
 export interface ChatMessage {
   id: string
   content: string | { ciphertext: string; iv: string; [key: string]: any } // Allow encrypted content objects
+  image?: string // Base64 encoded image data
   timestamp: number
   fromPublicKey: string
   toPublicKey: string
@@ -122,9 +123,10 @@ export class FriendService {
   }
 
   // Queue a message for offline friend
-  private queueMessageForOfflineFriend(friendPublicKey: string, content: string) {
+  private queueMessageForOfflineFriend(friendPublicKey: string, content: string, image?: string) {
     const queuedMessage = {
       content,
+      image,
       timestamp: Date.now(),
       id: crypto.randomUUID()
     }
@@ -1062,6 +1064,7 @@ export class FriendService {
       const chatMessage: ChatMessage = {
         id: crypto.randomUUID(),
         content: message.content, // Store original content (encrypted if it was encrypted)
+        image: message.image,
         timestamp: message.timestamp,
         fromPublicKey: fromPublicKey,
         toPublicKey: currentUser.publicKey,
@@ -1075,6 +1078,7 @@ export class FriendService {
     this.emit('chat:message_received', {
       from: fromPublicKey,
       content: displayContent, // Use displayContent for UI
+      image: message.image,
       timestamp: new Date(message.timestamp)
     })
     
@@ -1083,6 +1087,7 @@ export class FriendService {
       fromPublicKey: fromPublicKey,
       message: {
         content: displayContent, // Use displayContent (decrypted) for UI
+        image: message.image,
         timestamp: message.timestamp,
         encrypted: isEncrypted
       }
@@ -1133,10 +1138,8 @@ export class FriendService {
           updatedBy: friend
         })
       } else {
-        // This is a new post, save it normally
-        console.log('📥 New post from friend, saving to local feed cache')
-        await pigeonSocial.saveFollowedPost(message.post)
-        console.log('💾 Saved new shared post to local feed cache')
+        // This is a new post, emit event for the main feed to pick up immediately
+        console.log('� New post from friend, emitting to feed')
         
         // Emit event for the main feed to pick up immediately
         this.emit('post:shared', {
@@ -1372,7 +1375,7 @@ export class FriendService {
     }
   }
 
-  async sendMessage(friendPublicKey: string, content: string): Promise<boolean> {
+  async sendMessage(friendPublicKey: string, content: string, image?: string): Promise<boolean> {
     if (!this.mesh) {
       console.error('❌ Cannot send message - mesh not initialized')
       return false
@@ -1389,7 +1392,7 @@ export class FriendService {
       // If friend is offline, queue the message
       if (friend.connectionStatus === 'offline') {
         console.log('📤 Friend is offline, queuing message')
-        this.queueMessageForOfflineFriend(friendPublicKey, content)
+        this.queueMessageForOfflineFriend(friendPublicKey, content, image)
         return true // Return true as message is queued successfully
       }
 
@@ -1412,7 +1415,7 @@ export class FriendService {
         // If friend is marked as online but not in peerIdMap, queue the message
         if (friend.connectionStatus === 'online') {
           console.log('🚨 Friend marked online but not connected, queuing message')
-          this.queueMessageForOfflineFriend(friendPublicKey, content)
+          this.queueMessageForOfflineFriend(friendPublicKey, content, image)
           return true
         }
         
@@ -1422,6 +1425,7 @@ export class FriendService {
       const message: any = {
         type: 'chat_message',
         content: content,
+        image: image,
         timestamp: Date.now(),
         from: this.mesh.peerId
       }
@@ -1697,9 +1701,9 @@ export class FriendService {
     return connectedPeers.includes(peerId) ? 'connected' : 'disconnected'
   }
 
-  async sendMessageToFriend(publicKey: string, message: string): Promise<boolean> {
+  async sendMessageToFriend(publicKey: string, message: string, image?: string): Promise<boolean> {
     console.log('📤 Sending message to friend with key:', publicKey.substring(0, 8) + '...', 'Message:', message)
-    const result = await this.sendMessage(publicKey, message)
+    const result = await this.sendMessage(publicKey, message, image)
     console.log('📤 Send result:', result ? 'Success' : 'Failed')
     return result
   }
@@ -1784,33 +1788,6 @@ export class FriendService {
       }
       
       console.log(`📤 Post shared with ${friendsSharedWith} friends and ${followersSharedWith} followers`)
-      
-      // For debugging: if no friends/followers, simulate receiving our own post
-      if (friendsSharedWith === 0 && followersSharedWith === 0) {
-        console.log('🔄 No friends/followers to share with - simulating self-share for testing')
-        setTimeout(() => {
-          try {
-            const currentUser = pigeonSocial.getCurrentUser()
-            currentUser.then(user => {
-              if (user) {
-                this.emit('post:shared', {
-                  post: post,
-                  sharedBy: {
-                    userInfo: {
-                      username: 'test_friend',
-                      displayName: 'Test Friend'
-                    }
-                  },
-                  sharedAt: Date.now()
-                })
-                console.log('🔄 Simulated post share for testing')
-              }
-            })
-          } catch (error) {
-            console.error('❌ Failed to simulate post share:', error)
-          }
-        }, 1000)
-      }
     } catch (error) {
       console.error('❌ Failed to share post:', error)
     }
@@ -2276,7 +2253,7 @@ export class FriendService {
       if (!currentUser) return
 
       // Get our recent posts
-      const recentPosts = await pigeonSocial.getRecentPostsFromUser(currentUser.publicKey, 5)
+      const recentPosts = await pigeonSocial.getPostsByUser(currentUser.publicKey)
       
       const response = {
         type: 'recent_posts_response',
@@ -2298,11 +2275,20 @@ export class FriendService {
       console.log('📥 Received', message.posts?.length || 0, 'posts from friend:', fromPeerId)
       
       if (message.posts && message.posts.length > 0) {
-        // Save the friend's posts to our local feed cache
+        // Process the friend's posts (they're just shared, not saved separately)
         for (const post of message.posts) {
-          await pigeonSocial.saveFollowedPost(post)
+          this.emit('post:shared', {
+            post: post,
+            sharedBy: {
+              userInfo: {
+                username: 'friend',
+                displayName: 'Friend'
+              }
+            },
+            sharedAt: Date.now()
+          })
         }
-        console.log('💾 Saved friend posts to local feed cache')
+        console.log('� Processed friend posts for feed')
       }
     } catch (error) {
       console.error('❌ Failed to handle posts response:', error)
@@ -2390,8 +2376,8 @@ export class FriendService {
       if (!currentUser) return
 
       // Get our posts created since the requested timestamp
-      const allPosts = await pigeonSocial.getRecentPostsFromUser(currentUser.publicKey, 50) // Get more posts to filter
-      const missedPosts = allPosts.filter(post => post.timestamp > message.since)
+      const allPosts = await pigeonSocial.getPostsByUser(currentUser.publicKey)
+      const missedPosts = allPosts.filter((post: any) => post.timestamp > message.since)
       
       console.log('📤 Found', missedPosts.length, 'missed posts to send')
 
@@ -2415,11 +2401,20 @@ export class FriendService {
       console.log('📥 Received', message.posts?.length || 0, 'missed posts from friend:', fromPeerId)
       
       if (message.posts && message.posts.length > 0) {
-        // Save the friend's missed posts to our local feed cache
+        // Process the friend's missed posts
         for (const post of message.posts) {
-          await pigeonSocial.saveFollowedPost(post)
+          this.emit('post:shared', {
+            post: post,
+            sharedBy: {
+              userInfo: {
+                username: 'friend',
+                displayName: 'Friend'
+              }
+            },
+            sharedAt: Date.now()
+          })
         }
-        console.log('💾 Saved', message.posts.length, 'missed posts to local feed cache')
+        console.log('� Processed', message.posts.length, 'missed posts for feed')
         
         // Emit event to refresh the feed
         this.emit('missed-content:received', { type: 'posts', count: message.posts.length })
