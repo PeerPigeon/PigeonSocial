@@ -45,6 +45,8 @@ export class PigeonSocialService {
   private signalingServerUrl: string
   private webtorrentClient: any = null
   private activeTorrents = new Map()
+  private torrentToPostsMap = new Map<string, Set<string>>() // infoHash -> Set of post IDs
+  private postToTorrentMap = new Map<string, string>() // post ID -> infoHash
   private isReseeding: boolean = false
   private hasReseededThisSession: boolean = false
 
@@ -86,6 +88,11 @@ export class PigeonSocialService {
         
         this.webtorrentClient = new (window as any).WebTorrent(webTorrentConfig)
         console.log('✅ WebTorrent client initialized with proper STUN config')
+        
+        // Set up periodic cleanup of duplicate/stale torrents
+        setInterval(() => {
+          this.cleanupTorrents()
+        }, 5 * 60 * 1000) // Clean up every 5 minutes
       } else {
         console.log('⏳ Waiting for WebTorrent to load...')
         // Wait for WebTorrent to load
@@ -106,6 +113,11 @@ export class PigeonSocialService {
             
             this.webtorrentClient = new (window as any).WebTorrent(webTorrentConfig)
             console.log('✅ WebTorrent client initialized (delayed) with proper STUN config')
+            
+            // Set up periodic cleanup of duplicate/stale torrents
+            setInterval(() => {
+              this.cleanupTorrents()
+            }, 5 * 60 * 1000) // Clean up every 5 minutes
           } else {
             setTimeout(checkWebTorrent, 100)
           }
@@ -628,21 +640,39 @@ export class PigeonSocialService {
           if (storedFile) {
             console.log(`🌱 Found stored video file for post ${post.id}, re-seeding from storage`)
             
+            // Check if we're already seeding this file (by any post)
+            const existingTorrent = this.findExistingTorrentByMagnet(magnetUri)
+
+            if (existingTorrent) {
+              console.log(`♻️ Already seeding file ${storedFile.name} for post ${post.id}`)
+              const infoHash = existingTorrent.infoHash
+              this.linkPostToTorrent(post.id, infoHash)
+              this.activeTorrents.set(post.id, existingTorrent)
+              return
+            }
+
             // Re-seed using the stored file
             const torrent = this.webtorrentClient.seed(storedFile, {
               name: storedFile.name,
               announce: [
                 'wss://tracker.btorrent.xyz',
-                'wss://tracker.openwebtorrent.com'
+                'wss://tracker.openwebtorrent.com',
+                'wss://tracker.files.fm:7073/announce'
               ]
             })
 
             torrent.on('ready', () => {
               console.log(`🌱 Successfully re-seeding post ${post.id} from stored file (${torrent.files.length} files)`)
+              // Link the post to this torrent
+              this.linkPostToTorrent(post.id, torrent.infoHash)
             })
 
             torrent.on('error', (error: any) => {
               console.error(`❌ Error re-seeding post ${post.id} from stored file:`, error)
+              // Don't stop execution for duplicate torrent errors
+              if (error.message && error.message.includes('duplicate torrent')) {
+                console.log(`ℹ️ Torrent already exists, continuing...`)
+              }
             })
 
             this.activeTorrents.set(post.id, torrent)
@@ -652,20 +682,38 @@ export class PigeonSocialService {
               console.log(`ℹ️ Post ${post.id} is a shared post - adding torrent for streaming only (no re-seeding)`)
               
               try {
+                // Check if already added using the improved duplicate detection
+                const existingTorrent = this.findExistingTorrentByMagnet(magnetUri)
+
+                if (existingTorrent) {
+                  console.log(`♻️ Shared post ${post.id} torrent already exists`)
+                  const infoHash = existingTorrent.infoHash
+                  this.linkPostToTorrent(post.id, infoHash)
+                  this.activeTorrents.set(post.id, existingTorrent)
+                  return
+                }
+
                 // Add torrent for streaming without expecting to seed
                 const torrent = this.webtorrentClient.add(magnetUri, {
                   announce: [
                     'wss://tracker.btorrent.xyz',
-                    'wss://tracker.openwebtorrent.com'
+                    'wss://tracker.openwebtorrent.com',
+                    'wss://tracker.files.fm:7073/announce'
                   ]
                 })
                 
                 torrent.on('ready', () => {
                   console.log(`📺 Shared post ${post.id} ready for streaming (${torrent.files.length} files)`)
+                  // Link the post to this torrent
+                  this.linkPostToTorrent(post.id, torrent.infoHash)
                 })
                 
                 torrent.on('error', (error: any) => {
                   console.error(`❌ Error adding shared post ${post.id} for streaming:`, error)
+                  // Handle duplicate torrent errors gracefully
+                  if (error.message && error.message.includes('duplicate torrent')) {
+                    console.log(`ℹ️ Shared post torrent already exists, continuing...`)
+                  }
                 })
                 
                 this.activeTorrents.set(post.id, torrent)
@@ -962,7 +1010,7 @@ export class PigeonSocialService {
         announceList: [
           ['wss://tracker.btorrent.xyz'],
           ['wss://tracker.openwebtorrent.com'],
-          ['wss://tracker.fastcast.nz']
+          ['wss://tracker.files.fm:7073/announce']
         ]
       }
 
@@ -1119,8 +1167,8 @@ export class PigeonSocialService {
       throw new Error('WebTorrent client not initialized')
     }
 
-    // Check if we already have this torrent
-    const existingTorrent = this.webtorrentClient.get(magnetURI)
+    // Check if we already have this torrent using improved detection
+    const existingTorrent = this.findExistingTorrentByMagnet(magnetURI)
     if (existingTorrent) {
       console.log('📥 Torrent already exists:', existingTorrent.infoHash, 'for magnet:', magnetURI)
       console.log('📥 Existing torrent state:', {
@@ -1136,15 +1184,15 @@ export class PigeonSocialService {
         existingTorrent.destroy()
         this.activeTorrents.delete(existingTorrent.infoHash)
         // Continue to add it again
-      } else if (!existingTorrent.ready && existingTorrent.numPeers === 0) {
-        console.log('🔧 Existing torrent not ready and no peers - might be stuck, destroying and re-adding...')
+      } else if (!existingTorrent.ready && existingTorrent.numPeers === 0 && Date.now() - (existingTorrent.created || Date.now()) > 30000) {
+        console.log('🔧 Existing torrent not ready and no peers for 30s - might be stuck, destroying and re-adding...')
         existingTorrent.destroy()
         this.activeTorrents.delete(existingTorrent.infoHash)
         // Continue to add it again
       } else {
         // Torrent exists and is either working or still initializing
         console.log('📥 Using existing torrent - it seems to be working')
-        return
+        return Promise.resolve()
       }
     } else {
       console.log('📥 No existing torrent found - this is likely a page refresh, will add new torrent')
@@ -1153,7 +1201,14 @@ export class PigeonSocialService {
     console.log('📥 Adding/downloading torrent from magnet URI:', magnetURI.substring(0, 50) + '...')
 
     return new Promise((resolve, reject) => {
-      this.webtorrentClient.add(magnetURI, (torrent: any) => {
+      // Enhanced error handling for duplicate torrents
+      this.webtorrentClient.add(magnetURI, {
+        announce: [
+          'wss://tracker.btorrent.xyz',
+          'wss://tracker.openwebtorrent.com',
+          'wss://tracker.files.fm:7073/announce'
+        ]
+      }, (torrent: any) => {
         const infoHash = torrent.infoHash
         
         console.log('✅ Torrent added successfully:', {
@@ -1174,6 +1229,17 @@ export class PigeonSocialService {
         }
         
         resolve()
+      })
+
+      // Handle errors including duplicates
+      this.webtorrentClient.once('error', (error: any) => {
+        if (error.message && error.message.includes('duplicate torrent')) {
+          console.log('ℹ️ Torrent already exists, resolving as success')
+          resolve() // Treat duplicate as success
+        } else {
+          console.error('❌ Error adding torrent:', error)
+          reject(error)
+        }
       })
 
       // Longer timeout for downloading from peers
@@ -1488,6 +1554,109 @@ export class PigeonSocialService {
       downloaded: torrent.downloaded,
       total: torrent.length
     }
+  }
+
+  // Extract info hash from magnet URI
+  private extractInfoHashFromMagnet(magnetUri: string): string | null {
+    try {
+      const match = magnetUri.match(/xt=urn:btih:([a-fA-F0-9]{40}|[a-zA-Z2-7]{32})/)
+      return match ? match[1].toLowerCase() : null
+    } catch (error) {
+      console.error('Error extracting info hash from magnet URI:', error)
+      return null
+    }
+  }
+
+  // Helper method to link a post to a torrent
+  private linkPostToTorrent(postId: string, infoHash: string): void {
+    // Map post to torrent
+    this.postToTorrentMap.set(postId, infoHash)
+    
+    // Map torrent to posts (one torrent can serve multiple posts)
+    if (!this.torrentToPostsMap.has(infoHash)) {
+      this.torrentToPostsMap.set(infoHash, new Set())
+    }
+    this.torrentToPostsMap.get(infoHash)!.add(postId)
+  }
+
+  // Helper method to check if a torrent is already active for any post
+  private findExistingTorrentByMagnet(magnetUri: string): any {
+    const infoHash = this.extractInfoHashFromMagnet(magnetUri)
+    if (!infoHash) return null
+
+    return this.webtorrentClient.torrents.find((t: any) => 
+      t.infoHash === infoHash || t.magnetURI === magnetUri
+    )
+  }
+
+  // Clean up duplicate or stale torrents
+  cleanupTorrents(): void {
+    if (!this.webtorrentClient) return
+
+    const torrents = this.webtorrentClient.torrents
+    const infoHashes = new Set<string>()
+    const toRemove: any[] = []
+
+    torrents.forEach((torrent: any) => {
+      if (infoHashes.has(torrent.infoHash)) {
+        console.log(`🧹 Found duplicate torrent: ${torrent.infoHash}`)
+        toRemove.push(torrent)
+      } else {
+        infoHashes.add(torrent.infoHash)
+      }
+
+      // Also remove torrents that have been stuck for a long time
+      if (!torrent.ready && torrent.numPeers === 0 && Date.now() - (torrent.created || Date.now()) > 60000) {
+        console.log(`🧹 Removing stale torrent: ${torrent.infoHash}`)
+        toRemove.push(torrent)
+      }
+    })
+
+    toRemove.forEach(torrent => {
+      try {
+        torrent.destroy()
+        this.activeTorrents.delete(torrent.infoHash)
+        
+        // Clean up mapping
+        const relatedPosts = this.torrentToPostsMap.get(torrent.infoHash)
+        if (relatedPosts) {
+          relatedPosts.forEach(postId => {
+            this.postToTorrentMap.delete(postId)
+            this.activeTorrents.delete(postId)
+          })
+          this.torrentToPostsMap.delete(torrent.infoHash)
+        }
+      } catch (error) {
+        console.warn('Error removing torrent:', error)
+      }
+    })
+
+    if (toRemove.length > 0) {
+      console.log(`🧹 Cleaned up ${toRemove.length} duplicate/stale torrents`)
+    }
+  }
+
+  // Debug method to show current torrent state
+  debugTorrentState(): void {
+    console.log('🔍 Current torrent state:')
+    console.log('Active torrents:', this.webtorrentClient?.torrents.length || 0)
+    console.log('Post to torrent mapping:', Object.fromEntries(this.postToTorrentMap))
+    console.log('Torrent to posts mapping:', Object.fromEntries(
+      Array.from(this.torrentToPostsMap.entries()).map(([hash, posts]) => [
+        hash.substring(0, 8) + '...', 
+        Array.from(posts)
+      ])
+    ))
+    
+    this.webtorrentClient?.torrents.forEach((torrent: any, index: number) => {
+      console.log(`Torrent ${index + 1}:`, {
+        infoHash: torrent.infoHash?.substring(0, 8) + '...',
+        ready: torrent.ready,
+        files: torrent.files?.length || 0,
+        peers: torrent.numPeers,
+        name: torrent.name
+      })
+    })
   }
 }
 
