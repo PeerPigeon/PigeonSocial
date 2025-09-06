@@ -43,43 +43,76 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({ postId, magnetURI, onError })
         
         setStatus('Loading video file...')
         
-        // Check if we already have this torrent ready
+        // Check if we already have this torrent ready (from seeding or re-seeding)
         let videoFile = pigeonSocial.getVideoFile(magnetURI)
         
         if (videoFile) {
-          console.log('🎥 VideoPlayer: Video file already available!')
+          console.log('🎥 VideoPlayer: Video file already available (from seeding or re-seeding)!')
         } else {
-          console.log('🎥 VideoPlayer: Video not available, need to download/add torrent')
+          console.log('🎥 VideoPlayer: Video not immediately available, checking torrent status...')
           
-          setStatus('Downloading video from P2P network...')
+          // Check if torrent is being seeded (should be true for poster's own videos)
+          const isBeingSeeded = pigeonSocial.isTorrentBeingSeeded(magnetURI)
           
-          try {
-            await pigeonSocial.addTorrentFromMagnet(magnetURI)
-            console.log('🎥 VideoPlayer: Torrent added')
-          } catch (error: any) {
-            console.error('❌ VideoPlayer: Failed to add torrent:', error)
-            throw new Error('Failed to connect to P2P network for this video')
-          }
-          
-          if (!mounted) return
-          
-          // Wait for the torrent to become ready
-          setStatus('Waiting for video to download...')
-          let attempts = 0
-          const maxAttempts = 60
-          
-          while (attempts < maxAttempts && !videoFile && mounted) {
-            videoFile = pigeonSocial.getVideoFile(magnetURI)
-            if (!videoFile) {
-              await new Promise(resolve => setTimeout(resolve, 500))
+          if (isBeingSeeded) {
+            console.log('🎥 VideoPlayer: Torrent is being seeded, waiting for video file...')
+            
+            // Wait a bit longer for seeded torrents to become accessible
+            let attempts = 0
+            while (attempts < 10 && !videoFile) {
+              await new Promise(resolve => setTimeout(resolve, 200))
+              videoFile = pigeonSocial.getVideoFile(magnetURI)
               attempts++
+            }
+            
+            if (videoFile) {
+              console.log('🎥 VideoPlayer: Video file available from seeded torrent!')
+            } else {
+              console.warn('🎥 VideoPlayer: Torrent is seeded but video file not accessible')
             }
           }
           
-          if (!mounted) return
-          
           if (!videoFile) {
-            throw new Error('Video download timed out - no peers available')
+            console.log('🎥 VideoPlayer: Need to add torrent for streaming...')
+            
+            setStatus('Connecting to P2P network for streaming...')
+            
+            try {
+              console.log('🎥 VideoPlayer: Calling addTorrentFromMagnet for streaming...')
+              await pigeonSocial.addTorrentFromMagnet(magnetURI)
+              console.log('✅ VideoPlayer: Torrent added successfully!')
+            } catch (error: any) {
+              console.error('❌ VideoPlayer: Failed to add torrent:', error)
+              throw new Error('Failed to connect to P2P network for this video: ' + error.message)
+            }
+            
+            if (!mounted) return
+            
+            // Wait for the torrent to become ready for streaming
+            setStatus('Preparing video stream...')
+            console.log('🎥 VideoPlayer: Waiting for video file to become available for streaming...')
+            
+            let attempts = 0
+            const maxAttempts = 60
+            
+            while (attempts < maxAttempts && !videoFile && mounted) {
+              videoFile = pigeonSocial.getVideoFile(magnetURI)
+              console.log(`🎥 VideoPlayer: Attempt ${attempts + 1}/${maxAttempts} - videoFile available:`, !!videoFile)
+              
+              if (!videoFile) {
+                await new Promise(resolve => setTimeout(resolve, 500))
+                attempts++
+              }
+            }
+            
+            if (!mounted) return
+            
+            if (!videoFile) {
+              console.error('❌ VideoPlayer: Video streaming setup timed out after', maxAttempts, 'attempts')
+              throw new Error('Video streaming setup timed out - no peers available or torrent is broken')
+            }
+            
+            console.log('✅ VideoPlayer: Video file finally available for streaming after', attempts + 1, 'attempts')
           }
         }
         
@@ -101,9 +134,33 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({ postId, magnetURI, onError })
         console.log('🎥 VideoPlayer: Calling appendTo with container')
         
         // Use appendTo EXACTLY like wt.js - no options, no callback complications
-        videoFile.appendTo(containerRef.current)
+        videoFile.appendTo(containerRef.current, {
+          autoplay: false,  // NEVER autoplay - user must click play
+          muted: true,      // Muted to help prevent autoplay issues
+          controls: true    // Always show controls
+        })
         
-        console.log('✅ VideoPlayer: appendTo called - video will appear when ready!')
+        console.log('✅ VideoPlayer: appendTo called with autoplay=false - video will appear when ready!')
+        
+        // Find and configure the video element that WebTorrent creates
+        setTimeout(() => {
+          if (containerRef.current) {
+            const videoElement = containerRef.current.querySelector('video')
+            if (videoElement) {
+              videoElement.autoplay = false
+              videoElement.muted = true
+              videoElement.controls = true
+              videoElement.preload = 'metadata'
+              
+              // Force pause if somehow playing
+              if (!videoElement.paused) {
+                videoElement.pause()
+              }
+              
+              console.log('🎥 VideoPlayer: Configured WebTorrent-created video element - autoplay disabled')
+            }
+          }
+        }, 100)
         
         // Video will appear automatically when ready - just like wt.js
         setIsLoading(false)

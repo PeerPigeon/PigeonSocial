@@ -45,6 +45,8 @@ export class PigeonSocialService {
   private signalingServerUrl: string
   private webtorrentClient: any = null
   private activeTorrents = new Map()
+  private isReseeding: boolean = false
+  private hasReseededThisSession: boolean = false
 
   constructor() {
     // Get signaling server URL from config
@@ -452,18 +454,39 @@ export class PigeonSocialService {
       console.log('📰 Added', userPostIds.length, 'posts from current user')
     }
 
-    // Get posts from friends (simplified since getFriendPosts doesn't exist)
+    // Get posts from friends/shared posts
     try {
-      // For now, just skip friend posts since the method doesn't exist
-      console.log('📰 Friend posts temporarily disabled - method not available')
+      // Load shared posts from localStorage
+      const sharedPostsKey = `pigeon:shared_posts`
+      const sharedPostIds = JSON.parse(localStorage.getItem(sharedPostsKey) || '[]')
+      
+      for (const postId of sharedPostIds) {
+        const postJson = localStorage.getItem(`pigeon:posts.${postId}`)
+        if (postJson && !postIds.has(postId)) {
+          const post = JSON.parse(postJson)
+          posts.push(post)
+          postIds.add(postId)
+        }
+      }
+      console.log('📰 Added', sharedPostIds.length, 'shared posts from friends/followers')
     } catch (error) {
-      console.error('Failed to get friend posts:', error)
+      console.error('Failed to get shared posts:', error)
     }
 
     // Sort by timestamp (most recent first)
     posts.sort((a, b) => b.timestamp - a.timestamp)
     
     console.log('📰 Returning', posts.length, 'total posts for feed')
+    
+    // Only re-seed videos once per session, not every time getFeedPosts is called
+    if (!this.hasReseededThisSession) {
+      this.hasReseededThisSession = true
+      // Re-seed any video posts after loading feed (async, don't block)
+      this.reseedVideos().catch(error => {
+        console.error('Failed to re-seed videos:', error)
+      })
+    }
+    
     return posts.slice(0, 50) // Limit to 50 posts
   }
 
@@ -498,6 +521,244 @@ export class PigeonSocialService {
     
     console.log('👤 Found', posts.length, 'posts for user')
     return posts
+  }
+
+  // Re-seed all video posts after refresh (both poster and followers)
+  async reseedVideos(): Promise<void> {
+    // Prevent multiple simultaneous re-seeding attempts
+    if (this.isReseeding) {
+      console.log('🌱 Re-seeding already in progress, skipping...')
+      return
+    }
+    
+    this.isReseeding = true
+    console.log('🌱 Re-seeding all video posts after refresh...')
+    
+    try {
+      if (!this.webtorrentClient) {
+        console.log('❌ WebTorrent client not available for re-seeding')
+        return
+      }
+
+      // Get all posts from localStorage
+      const allPosts: Post[] = []
+      
+      // Get current user's posts
+      if (this.currentUser) {
+        const userPostsKey = `pigeon:user_posts.${this.currentUser.publicKey}`
+        const userPostIds = JSON.parse(localStorage.getItem(userPostsKey) || '[]')
+        
+        for (const postId of userPostIds) {
+          const postJson = localStorage.getItem(`pigeon:posts.${postId}`)
+          if (postJson) {
+            const post = JSON.parse(postJson)
+            if (post.video) {
+              allPosts.push(post)
+            }
+          }
+        }
+      }
+
+      // Also check for shared posts with videos
+      const sharedPostsKey = `pigeon:shared_posts`
+      const sharedPostIds = JSON.parse(localStorage.getItem(sharedPostsKey) || '[]')
+      
+      for (const postId of sharedPostIds) {
+        const postJson = localStorage.getItem(`pigeon:posts.${postId}`)
+        if (postJson) {
+          try {
+            const post = JSON.parse(postJson)
+            if (post.video && !allPosts.find(p => p.video === post.video)) {
+              allPosts.push(post)
+            }
+          } catch (error) {
+            console.error('Failed to parse shared post:', error)
+          }
+        }
+      }
+
+      console.log(`🌱 Found ${allPosts.length} video posts with potentially duplicate magnet URIs`)
+
+      // Track which magnet URIs we've already processed to avoid duplicates
+      const processedMagnets = new Set<string>()
+
+      // Re-seed each unique video torrent (not each post)
+      for (const post of allPosts) {
+        try {
+          const magnetUri = post.video
+          if (!magnetUri) {
+            console.log(`⚠️ Post ${post.id} has no video magnet URI, skipping`)
+            continue
+          }
+          
+          // Skip if we've already processed this magnet URI
+          if (processedMagnets.has(magnetUri)) {
+            console.log(`🔄 Magnet URI already processed for another post, skipping ${post.id}`)
+            continue
+          }
+          
+          processedMagnets.add(magnetUri)
+          console.log(`🌱 Re-seeding video for post ${post.id}:`, magnetUri.substring(0, 50) + '...')
+          
+          // Check if already being torrented
+          const existingTorrent = this.webtorrentClient.get(magnetUri)
+          if (existingTorrent) {
+            console.log(`🌱 Post ${post.id} already being seeded, ensuring it has the video file`)
+            
+            // Make sure the existing torrent actually has video files
+            if (existingTorrent.files && existingTorrent.files.length > 0) {
+              const videoFile = existingTorrent.files.find((file: any) => 
+                file.name.toLowerCase().match(/\.(mp4|avi|mkv|mov|wmv|flv|webm)$/)
+              )
+              if (videoFile) {
+                console.log(`✅ Post ${post.id} is already properly seeded with video file`)
+                continue
+              }
+            }
+            
+            // If torrent exists but is broken, destroy and re-seed
+            console.log(`🔧 Post ${post.id} torrent exists but is broken, destroying and re-seeding`)
+            existingTorrent.destroy()
+            this.activeTorrents.delete(existingTorrent.infoHash)
+          }
+
+          // Try to get the stored video file from IndexedDB for re-seeding
+          const storedFile = await this.getStoredVideoFile(magnetUri)
+          
+          if (storedFile) {
+            console.log(`🌱 Found stored video file for post ${post.id}, re-seeding from storage`)
+            
+            // Re-seed using the stored file
+            const torrent = this.webtorrentClient.seed(storedFile, {
+              name: storedFile.name,
+              announce: [
+                'wss://tracker.btorrent.xyz',
+                'wss://tracker.openwebtorrent.com'
+              ]
+            })
+
+            torrent.on('ready', () => {
+              console.log(`🌱 Successfully re-seeding post ${post.id} from stored file (${torrent.files.length} files)`)
+            })
+
+            torrent.on('error', (error: any) => {
+              console.error(`❌ Error re-seeding post ${post.id} from stored file:`, error)
+            })
+
+            this.activeTorrents.set(post.id, torrent)
+          } else {
+            // For shared posts (followers), don't try to re-seed, just add for potential streaming
+            if (post.id.startsWith('shared_')) {
+              console.log(`ℹ️ Post ${post.id} is a shared post - adding torrent for streaming only (no re-seeding)`)
+              
+              try {
+                // Add torrent for streaming without expecting to seed
+                const torrent = this.webtorrentClient.add(magnetUri, {
+                  announce: [
+                    'wss://tracker.btorrent.xyz',
+                    'wss://tracker.openwebtorrent.com'
+                  ]
+                })
+                
+                torrent.on('ready', () => {
+                  console.log(`📺 Shared post ${post.id} ready for streaming (${torrent.files.length} files)`)
+                })
+                
+                torrent.on('error', (error: any) => {
+                  console.error(`❌ Error adding shared post ${post.id} for streaming:`, error)
+                })
+                
+                this.activeTorrents.set(post.id, torrent)
+              } catch (error) {
+                console.error(`❌ Failed to add shared post ${post.id} for streaming:`, error)
+              }
+            } else {
+              console.log(`⚠️ No stored video file found for user post ${post.id}, cannot re-seed after refresh`)
+              console.log(`ℹ️ This is expected for videos you haven't created yourself`)
+            }
+          }
+
+        } catch (error) {
+          console.error(`❌ Failed to re-seed post ${post.id}:`, error)
+        }
+      }
+      
+      console.log(`✅ Re-seeding completed: processed ${processedMagnets.size} unique magnet URIs from ${allPosts.length} posts`)
+    } finally {
+      this.isReseeding = false
+    }
+  }
+
+  // Store video file persistently for re-seeding
+  private async storeVideoFile(magnetUri: string, file: File | Blob, fileName: string): Promise<void> {
+    try {
+      const db = await this.openVideoStorage()
+      const transaction = db.transaction(['videos'], 'readwrite')
+      const store = transaction.objectStore('videos')
+      
+      return new Promise((resolve, reject) => {
+        const request = store.put({
+          magnetUri,
+          file,
+          fileName,
+          storedAt: Date.now()
+        })
+        
+        request.onerror = () => reject(request.error)
+        request.onsuccess = () => {
+          console.log(`💾 Stored video file for re-seeding:`, fileName)
+          resolve()
+        }
+      })
+    } catch (error) {
+      console.error('Failed to store video file:', error)
+      throw error
+    }
+  }
+
+  // Get stored video file for re-seeding
+  private async getStoredVideoFile(magnetUri: string): Promise<File | null> {
+    try {
+      const db = await this.openVideoStorage()
+      const transaction = db.transaction(['videos'], 'readonly')
+      const store = transaction.objectStore('videos')
+      
+      return new Promise((resolve, reject) => {
+        const request = store.get(magnetUri)
+        
+        request.onerror = () => reject(request.error)
+        request.onsuccess = () => {
+          const result = request.result
+          if (result && result.file) {
+            console.log(`💾 Retrieved stored video file:`, result.fileName)
+            resolve(new File([result.file], result.fileName))
+          } else {
+            resolve(null)
+          }
+        }
+      })
+    } catch (error) {
+      console.error('Failed to get stored video file:', error)
+      return null
+    }
+  }
+
+  // Open IndexedDB for video storage
+  private async openVideoStorage(): Promise<IDBDatabase> {
+    return new Promise((resolve, reject) => {
+      const request = indexedDB.open('PigeonSocialVideos', 1)
+      
+      request.onerror = () => reject(request.error)
+      request.onsuccess = () => resolve(request.result)
+      
+      request.onupgradeneeded = (event) => {
+        const db = (event.target as IDBOpenDBRequest).result
+        if (!db.objectStoreNames.contains('videos')) {
+          const store = db.createObjectStore('videos', { keyPath: 'magnetUri' })
+          store.createIndex('fileName', 'fileName', { unique: false })
+        }
+      }
+    })
   }
 
   async updatePost(postId: string, updates: Partial<Post>): Promise<void> {
@@ -751,6 +1012,11 @@ export class PigeonSocialService {
             fileName: videoFile.name
           })
           
+          // Store the video file for re-seeding after refresh
+          this.storeVideoFile(magnetURI, videoFile, videoFile.name).catch(error => {
+            console.error('Failed to store video file for re-seeding:', error)
+          })
+          
           resolve(magnetURI)
         })
 
@@ -857,18 +1123,31 @@ export class PigeonSocialService {
     const existingTorrent = this.webtorrentClient.get(magnetURI)
     if (existingTorrent) {
       console.log('📥 Torrent already exists:', existingTorrent.infoHash, 'for magnet:', magnetURI)
+      console.log('📥 Existing torrent state:', {
+        ready: existingTorrent.ready,
+        files: existingTorrent.files?.length || 0,
+        progress: existingTorrent.progress,
+        numPeers: existingTorrent.numPeers
+      })
       
       // If the torrent exists but has no files, it might be broken - destroy and re-add
       if (existingTorrent.ready && (!existingTorrent.files || existingTorrent.files.length === 0)) {
-        console.log('🔧 Existing torrent is ready but broken, destroying and re-adding...')
+        console.log('🔧 Existing torrent is ready but broken (no files), destroying and re-adding...')
+        existingTorrent.destroy()
+        this.activeTorrents.delete(existingTorrent.infoHash)
+        // Continue to add it again
+      } else if (!existingTorrent.ready && existingTorrent.numPeers === 0) {
+        console.log('🔧 Existing torrent not ready and no peers - might be stuck, destroying and re-adding...')
         existingTorrent.destroy()
         this.activeTorrents.delete(existingTorrent.infoHash)
         // Continue to add it again
       } else {
         // Torrent exists and is either working or still initializing
-        console.log('📥 Using existing torrent')
+        console.log('📥 Using existing torrent - it seems to be working')
         return
       }
+    } else {
+      console.log('📥 No existing torrent found - this is likely a page refresh, will add new torrent')
     }
 
     console.log('📥 Adding/downloading torrent from magnet URI:', magnetURI.substring(0, 50) + '...')
@@ -1025,6 +1304,17 @@ export class PigeonSocialService {
     // Check our activeTorrents cache for the file info
     const torrentInfo = this.activeTorrents.get(torrent.infoHash)
     return !!torrentInfo
+  }
+
+  // Check if torrent is currently being seeded (has files and is available for streaming)
+  isTorrentBeingSeeded(magnetURI: string): boolean {
+    if (!this.webtorrentClient) return false
+    
+    const torrent = this.webtorrentClient.get(magnetURI)
+    if (!torrent) return false
+    
+    // Check if torrent has files and is ready for streaming
+    return torrent.files && torrent.files.length > 0 && torrent.ready
   }
 
   // Enhanced method to wait for video file to be available

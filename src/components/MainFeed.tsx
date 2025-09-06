@@ -29,23 +29,42 @@ export function MainFeed({ user, onLogout }: MainFeedProps) {
     const handleSharedPost = async ({ post, sharedBy }: any) => {
       console.log('📥 MainFeed received shared post from:', sharedBy.userInfo.username)
       
-      // Save the post to followed posts feed
+      // Save the shared post to localStorage for persistence after refresh
       try {
-        // Save followed post temporarily disabled
-        console.log('📥 Saving followed post temporarily disabled')
+        const sharedPost = {
+          ...post,
+          id: `shared_${post.id}_${Date.now()}`, // Create unique ID for shared post
+          sharedBy: sharedBy.userInfo.username,
+          originalAuthor: post.author
+        }
+        
+        // Save to localStorage
+        const postKey = `pigeon:posts.${sharedPost.id}`
+        localStorage.setItem(postKey, JSON.stringify(sharedPost))
+        
+        // Add to shared posts index for current user
+        const sharedPostsKey = `pigeon:shared_posts`
+        const existingSharedPosts = JSON.parse(localStorage.getItem(sharedPostsKey) || '[]')
+        existingSharedPosts.unshift(sharedPost.id)
+        localStorage.setItem(sharedPostsKey, JSON.stringify(existingSharedPosts.slice(0, 100))) // Keep only latest 100
+        
+        console.log('� Saved shared post to localStorage:', sharedPost.id)
+        
+        // Add shared post to current feed
+        setPosts(prevPosts => [sharedPost, ...prevPosts])
+        
       } catch (error) {
-        console.error('Failed to save followed post:', error)
+        console.error('Failed to save shared post:', error)
+        
+        // Fallback: still add to feed even if saving failed
+        const sharedPost = {
+          ...post,
+          id: `shared_${post.id}_${Date.now()}`,
+          sharedBy: sharedBy.userInfo.username,
+          originalAuthor: post.author
+        }
+        setPosts(prevPosts => [sharedPost, ...prevPosts])
       }
-      
-      // Add shared post to current feed with metadata
-      const sharedPost = {
-        ...post,
-        id: `shared_${post.id}_${Date.now()}`, // Create unique ID for shared post
-        sharedBy: sharedBy.userInfo.username,
-        originalAuthor: post.author
-      }
-      
-      setPosts(prevPosts => [sharedPost, ...prevPosts])
     }
 
         // Listen for missed content being received
